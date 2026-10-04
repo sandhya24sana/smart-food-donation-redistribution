@@ -1,0 +1,380 @@
+{
+  "profiles": [
+    {
+      "id": "user-7ff3a5e3",
+      "full_name": "Sandhya S",
+      "email": "sandhya24sana@gmail.com",
+      "phone": "+918102639740",
+      "role": "donor",
+      "organization_name": "student",
+      "address": "",
+      "city": "coimbatore",
+      "profile_image": "",
+      "password_hash": "4356a21b1b6643f1514a7c50e80d6fbdc0486a97567d193ce483c2538493713a",
+      "created_at": "2026-10-02T06:07:48.655242+00:00"
+    },
+    {
+      "id": "user-50918221",
+      "full_name": "Sandhya S",
+      "email": "sandysana@gmail.com",
+      "phone": "+918102639740",
+      "role": "ngo",
+      "organization_name": "student",
+      "address": "",
+      "city": "coimbatore",
+      "profile_image": "",
+      "password_hash": "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f",
+      "created_at": "2026-10-02T06:15:19.665117+00:00"
+    },
+    {
+      "id": "user-b2004414",
+      "full_name": "Sandhya S",
+      "email": "sandysana@gmail.com",
+      "phone": "+918102639740",
+      "role": "donor",
+      "organization_name": "student",
+      "address": "",
+      "city": "coimbatore",
+      "profile_image": "",
+      "password_hash": "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f",
+      "created_at": "2026-10-02T13:43:33.684665+00:00"
+    },
+    {
+      "id": "user-b4ea7016",
+      "full_name": "Sandhya S",
+      "email": "sandy@gmail.com",
+      "phone": "+918102639740",
+      "role": "volunteer",
+      "organization_name": "student",
+      "address": "",
+      "city": "coimbatore",
+      "profile_image": "",
+      "password_hash": "ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f",
+      "created_at": "2026-10-03T02:47:03.129099+00:00"
+    },
+    {
+      "id": "user-aadd5698",
+      "full_name": "Sandhya S",
+      "email": "sandysana@gmail.com",
+      "phone": "+918102639740",
+      "role": "volunteer",
+      "organization_name": "student",
+      "address": "",
+      "city": "coimbatore",
+      "profile_image": "",
+      "password_hash": "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f",
+      "created_at": "2026-10-03T05:45:11.618892+00:00"
+    },
+    {
+      "id": "user-483f3d12",
+      "full_name": "sandhya",
+      "email": "sandhya@gmail.com",
+      "phone": "08102639740",
+      "role": "ngo",
+      "organization_name": "food reduction platform",
+      "address": "student",
+      "city": "coimbatore",
+      "profile_image": "",
+      "created_at": "2026-10-04T12:12:11.679347+00:00"
+    },
+    {
+      "id": "user-0174e986",
+      "full_name": "ragul",
+      "email": "ragul@gmail.com",
+      "phone": "",
+      "role": "volunteer",
+      "organization_name": "",
+      "address": "",
+      "city": "",
+      "profile_image": "",
+      "created_at": "2026-10-04T12:13:00.738256+00:00"
+    },
+    {
+      "id": "user-dcecae2a",
+      "full_name": "ragul",
+      "email": "ragul@gmail.com",
+      "phone": "",
+      "role": "donor",
+      "organization_name": "",
+      "address": "",
+      "city": "",
+      "profile_image": "",
+      "created_at": "2026-10-04T12:39:44.226167+00:00"
+    },
+    {
+      "id": "user-1599ae79",
+      "full_name": "sanjay",
+      "email": "sanjay@example.com",
+      "phone": "",
+      "role": "donor",
+      "organization_name": "",
+      "address": "",
+      "city": "",
+      "profile_image": "",
+      "created_at": "2026-10-04T13:58:01.983867+00:00"
+    },
+    {
+      "id": "user-db38b399",
+      "full_name": "srinithi",
+      "email": "srinithi@example.com",
+      "phone": "",
+      "role": "requester",
+      "organization_name": "",
+      "address": "",
+      "city": "",
+      "profile_image": "",
+      "created_at": "2026-10-04T13:59:15.668645+00:00"
+    }
+  ],
+  "donations": [],
+  "donation_requests": [],
+  "donation_status_history": [
+    {
+      "id": "history-432e0392",
+      "donation_id": "donation-bf60151f52b3407cbc0abb2d723b03e5",
+      "previous_status": null,
+      "new_status": "available",
+      "changed_by": "user-b2004414",
+      "note": "Donation listed",
+      "created_at": "2026-10-03T02:06:17.102530+00:00"
+    },
+    {
+      "id": "history-fa02893667654dfd89736f203300fc6e",
+      "donation_id": "donation-bf60151f52b3407cbc0abb2d723b03e5",
+      "previous_status": "completed",
+      "new_status": "available",
+      "changed_by": "system",
+      "note": "Synthetic demonstration request and delivery records were removed",
+      "created_at": "2026-10-04T13:49:57.320779+00:00"
+    }
+  ],
+  "community_needs": [
+    {
+      "id": "need-a2cd0c75",
+      "ngo_id": "user-483f3d12",
+      "category": "Meals",
+      "required_quantity": 25.0,
+      "servings": 25,
+      "location": "anna nagar",
+      "city": "Coimbatore",
+      "urgency": "high",
+      "required_date": "2026-10-04T18:46",
+      "description": "needed",
+      "status": "fulfilled",
+      "created_at": "2026-10-04T13:17:04.240551+00:00",
+      "updated_at": "2026-10-04T14:04:34.323370+00:00",
+      "delivered_quantity": 25.0
+    }
+  ],
+  "community_need_contributions": [
+    {
+      "id": "contrib-891e98c5",
+      "need_id": "need-a2cd0c75",
+      "donor_id": "user-1599ae79",
+      "quantity": 25.0,
+      "pickup_location": "samanaickenpalayam",
+      "status": "delivered",
+      "created_at": "2026-10-04T14:03:53.222246+00:00",
+      "delivery_task_id": "delivery-ef5e17a87d",
+      "volunteer_id": "user-0174e986",
+      "assigned_at": "2026-10-04T14:04:15.046236+00:00",
+      "delivered_at": "2026-10-04T14:04:34.323370+00:00"
+    }
+  ],
+  "notifications": [
+    {
+      "id": "notify-868ea4d4",
+      "user_id": "user-b2004414",
+      "message": "Donation created successfully: rice.",
+      "type": "donation",
+      "link": "/donor",
+      "read_at": null,
+      "created_at": "2026-10-03T02:06:17.102561+00:00"
+    },
+    {
+      "id": "notify-b8ba6a2e",
+      "user_id": "user-b4ea7016",
+      "message": "Welcome! Your account has been created successfully.",
+      "type": "welcome",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-03T02:47:03.129133+00:00"
+    },
+    {
+      "id": "notify-40bc2e0d",
+      "user_id": "user-483f3d12",
+      "message": "Your community food need has been posted successfully.",
+      "type": "community_need",
+      "link": "/ngo",
+      "read_at": null,
+      "created_at": "2026-10-04T13:17:04.240618+00:00"
+    },
+    {
+      "id": "notify-578e58b8",
+      "user_id": "user-483f3d12",
+      "message": "sanjay responded to the need for 25.0 servings.",
+      "type": "community_need",
+      "link": "/ngo",
+      "read_at": null,
+      "created_at": "2026-10-04T14:03:53.222316+00:00"
+    },
+    {
+      "id": "notify-46ddc503",
+      "user_id": "user-0174e986",
+      "message": "You have been assigned a delivery for the Meals community need.",
+      "type": "delivery",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:15.046236+00:00"
+    },
+    {
+      "id": "notify-a25f77f1",
+      "user_id": "user-483f3d12",
+      "message": "ragul was assigned to a community need delivery.",
+      "type": "community_need",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:15.046236+00:00"
+    },
+    {
+      "id": "notify-5bb4f58a",
+      "user_id": "user-483f3d12",
+      "message": "ragul accepted a delivery task.",
+      "type": "delivery",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:33.185359+00:00"
+    },
+    {
+      "id": "notify-805bfbe3",
+      "user_id": "user-483f3d12",
+      "message": "ragul accepted a community food need delivery.",
+      "type": "community_need",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:33.185395+00:00"
+    },
+    {
+      "id": "notify-7acbd660",
+      "user_id": "user-483f3d12",
+      "message": "Community need delivery status changed to picked up.",
+      "type": "community_need",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:33.867938+00:00"
+    },
+    {
+      "id": "notify-1ef1ff75",
+      "user_id": "user-483f3d12",
+      "message": "ragul marked a delivery as delivered.",
+      "type": "delivery",
+      "link": "/delivery-feedback/delivery-ef5e17a87d",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:33.867967+00:00"
+    },
+    {
+      "id": "notify-17d70035",
+      "user_id": "user-483f3d12",
+      "message": "Community need delivery status changed to in transit.",
+      "type": "community_need",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:34.152939+00:00"
+    },
+    {
+      "id": "notify-07a66995",
+      "user_id": "user-483f3d12",
+      "message": "ragul marked a delivery as delivered.",
+      "type": "delivery",
+      "link": "/delivery-feedback/delivery-ef5e17a87d",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:34.152987+00:00"
+    },
+    {
+      "id": "notify-e9c0e71e",
+      "user_id": "user-483f3d12",
+      "message": "Community need for Meals was fulfilled after delivery.",
+      "type": "community_need",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-04T14:04:34.323515+00:00"
+    }
+  ],
+  "distribution_records": [],
+  "donation_certificates": [],
+  "donor_rewards": [],
+  "impact_stories": [],
+  "complaints": [],
+  "audit_logs": [
+    {
+      "id": "audit-c2aadf65a80245208f019d143fb9350c",
+      "user_id": "user-8339a96e",
+      "action": "donation_deleted",
+      "entity_type": "donation",
+      "entity_id": "donation-9ea059fbe73342a2ba2ce6fdf3877504",
+      "details": {
+        "food_name": "Updated UI Test Meal"
+      },
+      "created_at": "2026-10-04T12:54:08.728979+00:00"
+    }
+  ],
+  "sessions": [
+    {
+      "token": "2554e1b2de50430fac5d7950334aefe9",
+      "user_id": "user-db38b399",
+      "created_at": "2026-10-04T14:32:35.144228+00:00"
+    }
+  ],
+  "donation_submission_keys": {
+    "user-b2004414:ceb3fa0f-c508-4b10-81b9-3285fe0a356b": "donation-bf60151f52b3407cbc0abb2d723b03e5"
+  },
+  "delivery_tasks": [
+    {
+      "id": "delivery-ef5e17a87d",
+      "request_id": null,
+      "donation_id": null,
+      "community_need_id": "need-a2cd0c75",
+      "community_contribution_id": "contrib-891e98c5",
+      "ngo_id": "user-483f3d12",
+      "volunteer_id": "user-0174e986",
+      "pickup_location": "samanaickenpalayam",
+      "pickup_instructions": "",
+      "dropoff_location": "anna nagar, Coimbatore",
+      "dropoff_instructions": "needed",
+      "status": "delivered",
+      "status_history": [
+        {
+          "status": "assigned",
+          "changed_by": "user-483f3d12",
+          "created_at": "2026-10-04T14:04:15.046236+00:00"
+        },
+        {
+          "status": "accepted",
+          "changed_by": "user-0174e986",
+          "created_at": "2026-10-04T14:04:33.185288+00:00"
+        },
+        {
+          "status": "picked_up",
+          "changed_by": "user-0174e986",
+          "created_at": "2026-10-04T14:04:33.867866+00:00"
+        },
+        {
+          "status": "in_transit",
+          "changed_by": "user-0174e986",
+          "created_at": "2026-10-04T14:04:34.152669+00:00"
+        },
+        {
+          "status": "delivered",
+          "changed_by": "user-0174e986",
+          "created_at": "2026-10-04T14:04:34.323370+00:00"
+        }
+      ],
+      "created_at": "2026-10-04T14:04:15.046236+00:00",
+      "updated_at": "2026-10-04T14:04:34.323370+00:00"
+    }
+  ],
+  "volunteer_availability": [],
+  "delivery_feedback": [],
+  "request_contributions": [],
+  "delivery_issues": []
+}
