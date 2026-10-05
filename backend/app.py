@@ -232,6 +232,49 @@ def delivery_task_donation_id(data, task):
     return contribution.get('donation_id') if contribution else None
 
 
+def delivery_issue_reporter_id(issue):
+    return issue.get('reporter_id') or issue.get('user_id') or issue.get('receiver_id')
+
+
+def delivery_task_donor_id(data, task):
+    contribution = next(
+        (
+            item for item in data.get('request_contributions', [])
+            if item.get('id') == task.get('request_contribution_id')
+        ),
+        None,
+    )
+    if contribution:
+        return contribution.get('donor_id')
+    donation_id = delivery_task_donation_id(data, task)
+    donation = next(
+        (item for item in data.get('donations', []) if item.get('id') == donation_id),
+        None,
+    )
+    return donation.get('donor_id') if donation else None
+
+
+def delivery_task_request(data, task):
+    request_id = task.get('request_id')
+    if not request_id:
+        contribution = next(
+            (
+                item for item in data.get('request_contributions', [])
+                if item.get('id') == task.get('request_contribution_id')
+            ),
+            None,
+        )
+        request_id = contribution.get('request_id') if contribution else None
+    return next(
+        (item for item in data.get('donation_requests', []) if item.get('id') == request_id),
+        None,
+    )
+
+
+def delivery_task_owned_by_donor(data, task, donor_id):
+    return delivery_task_donor_id(data, task) == donor_id
+
+
 def donation_delivered_quantity(data, donation):
     donation_id = donation.get('id')
     requests_by_id = {
@@ -508,49 +551,10 @@ def donor_completed_donations(data, donor_id):
 
 def create_donor_certificates(data, donor_id):
     completed_donations = donor_completed_donations(data, donor_id)
-    donation_certificates = []
     milestone_certificates = []
     certificates_changed = False
     certificates = data.setdefault('donation_certificates', [])
     donor = find_profile_by_id(data, donor_id) or {}
-
-    for completed_count, completed_item in enumerate(completed_donations, start=1):
-        donation = completed_item['donation']
-        existing_certificate = next(
-            (
-                item for item in certificates
-                if item.get('donor_id') == donor_id
-                and item.get('donation_id') == donation.get('id')
-                and (item.get('certificate_type') == 'donation' or not item.get('milestone'))
-            ),
-            None,
-        )
-        if existing_certificate:
-            if 'completed_donations' not in existing_certificate:
-                existing_certificate['completed_donations'] = completed_count
-                certificates_changed = True
-            continue
-        certificate = {
-            'id': f'certificate-{uuid.uuid4().hex}',
-            'certificate_id': f'SFDRS-DON-{uuid.uuid4().hex.upper()}',
-            'certificate_type': 'donation',
-            'donor_id': donor_id,
-            'donor_name': donor.get('full_name', ''),
-            'donation_id': donation.get('id'),
-            'food_name': donation.get('food_name', ''),
-            'category': donation.get('category', ''),
-            'quantity': donation.get('quantity', 0),
-            'quantity_unit': donation.get('quantity_unit', ''),
-            'completed_donations': completed_count,
-            'donation_date': donation.get('created_at', ''),
-            'delivery_date': completed_item['delivery_date'],
-            'title': 'Certificate of Food Donation',
-            'message': 'Your generous food donation helped reduce food waste and bring nourishment to people in need.',
-            'created_at': utc_now(),
-        }
-        certificates.append(certificate)
-        donation_certificates.append(certificate)
-        certificates_changed = True
 
     for target, milestone in DONATION_MILESTONES.items():
         if len(completed_donations) < target:
@@ -599,7 +603,7 @@ def create_donor_certificates(data, donor_id):
             milestone_certificates.append(certificate)
             certificates_changed = True
     return {
-        'donation_certificates': donation_certificates,
+        'donation_certificates': [],
         'milestone_certificates': milestone_certificates,
         'changed': certificates_changed,
     }
@@ -2043,7 +2047,7 @@ def list_requests():
                 ]
                 visible_issues = [
                     entry for entry in issues_by_task.get(task.get('id'), [])
-                    if user.get('role') == 'ngo' or entry.get('receiver_id') == user.get('id')
+                    if user.get('role') == 'ngo' or delivery_issue_reporter_id(entry) == user.get('id')
                 ]
                 request_item['delivery_tasks'].append({
                     'id': task.get('id'),
@@ -2670,10 +2674,7 @@ def list_delivery_tasks():
             ]
         task['feedback'] = task_feedback
         task['issues'] = task_issues
-        request_item = next(
-            (item for item in data.get('donation_requests', []) if item.get('id') == task.get('request_id')),
-            None,
-        )
+        request_item = delivery_task_request(data, task)
         if user.get('role') == 'ngo' and request_item:
             receiver = profiles_by_id.get(request_item.get('requester_id', request_item.get('ngo_id')), {})
             task['receiver_name'] = receiver.get('organization_name') or receiver.get('full_name', 'Food receiver')
@@ -3051,17 +3052,7 @@ def donor_certificates():
     if created_certificates['changed']:
         save_data(data)
     completed_donations = donor_completed_donations(data, user['id'])
-    completed_donation_ids = {item['donation'].get('id') for item in completed_donations}
     completed_count = len(completed_donations)
-    donor_certificates = [
-        item for item in data.get('donation_certificates', [])
-        if item.get('donor_id') == user['id']
-        and item.get('donation_id') in completed_donation_ids
-        and (
-            item.get('certificate_type') == 'donation'
-            or (item.get('donation_id') and not item.get('milestone'))
-        )
-    ]
     milestone_targets = {
         milestone['key']: target
         for target, milestone in DONATION_MILESTONES.items()
@@ -3075,7 +3066,6 @@ def donor_certificates():
         and int(item.get('completed_donations', item.get('completed_deliveries', 0)) or 0)
         == milestone_targets[item['milestone']]
     ]
-    donor_certificates.sort(key=lambda item: (item.get('delivery_date') or '', item.get('donation_id') or ''))
     milestone_certificates.sort(key=lambda item: item.get('completed_donations', 0))
     milestone_progress = [
         {
@@ -3095,7 +3085,7 @@ def donor_certificates():
     return jsonify({
         'completed_donations': completed_count,
         'completed_deliveries': completed_count,
-        'donation_certificates': donor_certificates,
+        'donation_certificates': [],
         'milestone_certificates': milestone_certificates,
         'milestones': milestone_progress,
         'next_milestone': next_milestone,
@@ -3311,7 +3301,7 @@ def delivery_task_feedback(task_id):
             visible_issues = [
                 item for item in data.get('delivery_issues', [])
                 if item.get('task_id') == task_id
-                and (user.get('role') == 'ngo' or item.get('receiver_id') == user['id'])
+                and (user.get('role') == 'ngo' or delivery_issue_reporter_id(item) == user['id'])
             ]
         donation_id = delivery_task_donation_id(data, task)
         donation = next(
@@ -3510,8 +3500,17 @@ def delivery_task_issues(task_id):
         None,
     )
     if request.method == 'POST':
-        if user.get('role') != 'requester' or not request_item or request_item.get('requester_id', request_item.get('ngo_id')) != user.get('id'):
-            return jsonify({'error': 'Only the receiver who owns this delivery can report an issue.'}), 403
+        donor_report = (
+            user.get('role') == 'donor'
+            and delivery_task_owned_by_donor(data, task, user.get('id'))
+        )
+        requester_report = (
+            user.get('role') == 'requester'
+            and request_item
+            and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id')
+        )
+        if not (donor_report or requester_report):
+            return jsonify({'error': 'Only the requester or donor associated with this delivery can report an issue.'}), 403
         if task.get('status') != 'delivered':
             return jsonify({'error': 'An issue can only be reported after the delivery is completed.'}), 409
         payload = request.get_json(silent=True) or {}
@@ -3530,32 +3529,50 @@ def delivery_task_issues(task_id):
         with DELIVERY_ISSUE_LOCK:
             data = load_data()
             task = next((item for item in data.get('delivery_tasks', []) if item.get('id') == task_id), None)
-            request_item = next(
-                (item for item in data.get('donation_requests', []) if item.get('id') == task.get('request_id')),
-                None,
-            ) if task else None
-            if not task or not request_item or request_item.get('requester_id', request_item.get('ngo_id')) != user.get('id'):
+            request_item = delivery_task_request(data, task) if task else None
+            donor_report = bool(
+                task
+                and user.get('role') == 'donor'
+                and delivery_task_owned_by_donor(data, task, user.get('id'))
+            )
+            requester_report = bool(
+                task
+                and user.get('role') == 'requester'
+                and request_item
+                and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id')
+            )
+            if not task or not (donor_report or requester_report):
                 return jsonify({'error': 'You are not authorized to report an issue for this delivery.'}), 403
             if task.get('status') != 'delivered':
                 return jsonify({'error': 'An issue can only be reported after the delivery is completed.'}), 409
             issues = data.setdefault('delivery_issues', [])
             if any(
-                item.get('task_id') == task_id and item.get('receiver_id') == user.get('id')
+                item.get('task_id') == task_id and delivery_issue_reporter_id(item) == user.get('id')
                 for item in issues
             ):
                 return jsonify({'error': 'You have already reported an issue for this delivery.'}), 409
 
             created_at = utc_now()
+            donation_id = delivery_task_donation_id(data, task)
+            issue_request_id = (
+                task.get('request_id')
+                or (request_item.get('id') if request_item else None)
+            )
             issue = {
                 'id': f'issue-{uuid.uuid4().hex[:10]}',
-                'request_id': request_item.get('id'),
+                'reporter_id': user['id'],
+                'reporter_role': user.get('role'),
+                'donor_id': delivery_task_donor_id(data, task),
+                'donation_id': donation_id,
+                'request_id': issue_request_id,
                 'delivery_id': task_id,
                 'task_id': task_id,
-                'receiver_id': user['id'],
+                'ngo_id': task.get('ngo_id'),
                 'category': category,
                 'description': description,
                 'additional_details': additional_details,
                 'status': 'open',
+                'resolver_id': None,
                 'status_history': [{
                     'status': 'open',
                     'changed_by': user['id'],
@@ -3564,11 +3581,13 @@ def delivery_task_issues(task_id):
                 'created_at': created_at,
                 'updated_at': created_at,
             }
+            if user.get('role') == 'requester':
+                issue['receiver_id'] = user['id']
             issues.append(issue)
             notify_user(
                 data,
                 task.get('ngo_id'),
-                f'A delivery issue was reported for request {request_item.get("id")} (delivery {task_id}).',
+                f'A delivery issue was reported for request {issue_request_id or "not linked"} (delivery {task_id}).',
                 notification_type='delivery_issue',
             )
             save_data(data)
@@ -3590,11 +3609,97 @@ def delivery_task_issues(task_id):
     elif user.get('role') == 'requester' and request_item and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id'):
         issues = [
             item for item in data.get('delivery_issues', [])
-            if item.get('task_id') == task_id and item.get('receiver_id') == user.get('id')
+            if item.get('task_id') == task_id and delivery_issue_reporter_id(item) == user.get('id')
+        ]
+    elif user.get('role') == 'donor' and delivery_task_owned_by_donor(data, task, user.get('id')):
+        issues = [
+            item for item in data.get('delivery_issues', [])
+            if item.get('task_id') == task_id and delivery_issue_reporter_id(item) == user.get('id')
         ]
     else:
         return jsonify({'error': 'You are not authorized to view issues for this delivery.'}), 403
     return jsonify({'issues': issues})
+
+
+@app.route('/api/donor/delivery-issues', methods=['GET'])
+def list_donor_delivery_issues():
+    user = current_user_from_auth()
+    if not user:
+        return jsonify({'error': 'Authentication required'}), 401
+    if user.get('role') != 'donor':
+        return jsonify({'error': 'Only donors can view donor delivery issues.'}), 403
+
+    data = load_data()
+    tasks_by_id = {
+        task.get('id'): task
+        for task in data.get('delivery_tasks', [])
+    }
+    requests_by_id = {
+        request_item.get('id'): request_item
+        for request_item in data.get('donation_requests', [])
+    }
+    donations_by_id = {
+        donation.get('id'): donation
+        for donation in data.get('donations', [])
+    }
+    own_issues = []
+    for issue in data.get('delivery_issues', []):
+        task = tasks_by_id.get(issue.get('task_id') or issue.get('delivery_id'))
+        request_item = (
+            delivery_task_request(data, task)
+            if task else requests_by_id.get(issue.get('request_id'))
+        )
+        donation_id = issue.get('donation_id') or (
+            delivery_task_donation_id(data, task) if task else None
+        ) or (request_item.get('donation_id') if request_item else None)
+        donation = donations_by_id.get(donation_id, {})
+        related_donor_id = (
+            (delivery_task_donor_id(data, task) if task else None)
+            or donation.get('donor_id')
+            or issue.get('donor_id')
+        )
+        if related_donor_id != user.get('id'):
+            continue
+        request_id = issue.get('request_id') or (request_item.get('id') if request_item else None)
+        issue_data = {
+            **issue,
+            'donor_id': related_donor_id,
+            'donation_id': donation_id,
+            'request_id': request_id,
+            'delivery_id': issue.get('delivery_id') or issue.get('task_id'),
+            'donation_name': donation.get('food_name', ''),
+            'request_name': requests_by_id.get(request_id, {}).get('food_name', ''),
+        }
+        own_issues.append(issue_data)
+
+    reportable_deliveries = []
+    reported_task_ids = {
+        issue.get('task_id') or issue.get('delivery_id')
+        for issue in own_issues
+    }
+    for task in data.get('delivery_tasks', []):
+        if (
+            task.get('status') != 'delivered'
+            or task.get('id') in reported_task_ids
+            or not delivery_task_owned_by_donor(data, task, user.get('id'))
+        ):
+            continue
+        donation_id = delivery_task_donation_id(data, task)
+        donation = donations_by_id.get(donation_id, {})
+        request_item = delivery_task_request(data, task) or {}
+        reportable_deliveries.append({
+            'id': task.get('id'),
+            'delivery_id': task.get('id'),
+            'request_id': request_item.get('id'),
+            'donation_id': donation_id,
+            'food_name': donation.get('food_name') or request_item.get('food_name', ''),
+            'category': donation.get('category', ''),
+        })
+
+    return jsonify({
+        'issues': sorted(own_issues, key=lambda issue: issue.get('created_at', '')),
+        'reportable_deliveries': reportable_deliveries,
+    })
 
 
 @app.route('/api/delivery-issues/<issue_id>', methods=['PATCH'])
@@ -3620,11 +3725,25 @@ def update_delivery_issue(issue_id):
     if not issue:
         return jsonify({'error': 'Delivery issue not found.'}), 404
     task = next(
-        (item for item in data.get('delivery_tasks', []) if item.get('id') == issue.get('task_id')),
+        (
+            item for item in data.get('delivery_tasks', [])
+            if item.get('id') == (issue.get('task_id') or issue.get('delivery_id'))
+        ),
         None,
     )
     if not task or task.get('ngo_id') != user.get('id'):
         return jsonify({'error': 'You can only update issues for deliveries coordinated by your organization.'}), 403
+
+    current_status = issue.get('status', 'open')
+    allowed_next_status = {
+        'open': {'open', 'under_review'},
+        'under_review': {'under_review', 'resolved'},
+        'resolved': {'resolved'},
+    }
+    if next_status not in allowed_next_status.get(current_status, set()):
+        return jsonify({
+            'error': 'Issue status must follow the Open -> Under Review -> Resolved lifecycle.',
+        }), 409
 
     resolution_note = str(
         payload.get('resolution_note', issue.get('resolution_note', '')) or ''
@@ -3635,6 +3754,7 @@ def update_delivery_issue(issue_id):
         issue['status'] = next_status
         issue['resolution_note'] = resolution_note
         issue['updated_at'] = utc_now()
+        issue['resolver_id'] = user['id']
         if status_changed:
             issue.setdefault('status_history', []).append({
                 'status': next_status,

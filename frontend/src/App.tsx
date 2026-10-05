@@ -495,7 +495,12 @@ type DeliveryIssue = {
   request_id: string
   delivery_id: string
   task_id: string
+  reporter_id?: string
+  reporter_role?: string
+  donor_id?: string
+  donation_id?: string
   receiver_id?: string
+  resolver_id?: string | null
   category?: string
   description: string
   additional_details?: string
@@ -504,6 +509,20 @@ type DeliveryIssue = {
   status_history?: Array<{ status: string; created_at: string }>
   created_at: string
   updated_at: string
+}
+
+type DonorReportableDelivery = {
+  id: string
+  delivery_id: string
+  request_id?: string
+  donation_id?: string
+  food_name?: string
+  category?: string
+}
+
+type DonorDeliveryIssue = DeliveryIssue & {
+  donation_name?: string
+  request_name?: string
 }
 
 type DeliveryIssueContext = {
@@ -785,15 +804,6 @@ type DonationCertificate = {
   message?: string
 }
 
-type DonationMilestoneProgress = {
-  key: string
-  title: string
-  required_donations: number
-  completed_donations: number
-  remaining_donations: number
-  progress_percent: number
-}
-
 function escapeXml(value: string): string {
   return value.replace(/[<>&'"]/g, (character) => ({
     '<': '&lt;',
@@ -971,25 +981,15 @@ function isDonorCertificate(certificate: DonationCertificate): boolean {
 
 function createDonationCertificateHtml(
   certificate: DonationCertificate,
-  milestoneDonation?: DonationCertificate,
 ): string {
-  const isMilestone = certificate.certificate_type === 'milestone' || Boolean(certificate.milestone)
-  const donation = milestoneDonation || certificate
-  const quantity = `${donation.quantity ?? 0} ${donation.quantity_unit || ''}`.trim()
   const completedDonations = Number(certificate.completed_donations ?? certificate.completed_deliveries ?? 0)
   return createCertificateDocumentHtml({
     recipientName: certificate.donor_name,
     certificateId: certificate.certificate_id,
-    achievementTitle: isMilestone
-      ? certificate.milestone_name || certificate.title
-      : 'In recognition of your completed food donation',
-    detailLabel: isMilestone ? 'DONATION MILESTONE' : 'FOOD CONTRIBUTED',
-    detailValue: isMilestone
-      ? `${completedDonations} completed donation${completedDonations === 1 ? '' : 's'}`
-      : certificate.food_name || 'Food donation',
-    supportingDetails: isMilestone
-      ? `Achievement donation: ${donation.food_name || 'Food donation'} · Quantity: ${quantity} · Category: ${donation.category || 'Food'}`
-      : `Quantity: ${quantity} · Category: ${donation.category || 'Food'}`,
+    achievementTitle: certificate.milestone_name || certificate.title,
+    detailLabel: 'DONATION MILESTONE',
+    detailValue: `${completedDonations} completed donation${completedDonations === 1 ? '' : 's'}`,
+    supportingDetails: 'A milestone achieved through completed food donations.',
     achievementDate: certificateDate(
       certificate.achievement_date || certificate.delivery_date || certificate.donation_date || '',
     ),
@@ -2737,6 +2737,15 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
 
 function DonorDashboard({ user, overview, donations, requests, needs, onReload }: { user: SessionUser; overview: DashboardSummary | null; donations: Donation[]; requests: RequestItem[]; needs: CommunityNeed[]; onReload: () => Promise<void> }) {
   const [message, setMessage] = useState('')
+  const [deliveryIssues, setDeliveryIssues] = useState<DonorDeliveryIssue[]>([])
+  const [reportableDeliveries, setReportableDeliveries] = useState<DonorReportableDelivery[]>([])
+  const [deliveryIssuesLoading, setDeliveryIssuesLoading] = useState(true)
+  const [deliveryIssuesError, setDeliveryIssuesError] = useState('')
+  const [deliveryIssueTaskId, setDeliveryIssueTaskId] = useState('')
+  const [deliveryIssueCategory, setDeliveryIssueCategory] = useState('Food quality')
+  const [deliveryIssueDescription, setDeliveryIssueDescription] = useState('')
+  const [submittingDeliveryIssue, setSubmittingDeliveryIssue] = useState(false)
+  const [deliveryIssuesRefresh, setDeliveryIssuesRefresh] = useState(0)
   const [donationEditMessage, setDonationEditMessage] = useState('')
   const [donationEditMessageType, setDonationEditMessageType] = useState<'success' | 'error'>('success')
   const [editingDonationId, setEditingDonationId] = useState<string | null>(null)
@@ -2752,10 +2761,8 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
   const [cancellingDonation, setCancellingDonation] = useState(false)
   const [needPickupLocations, setNeedPickupLocations] = useState<Record<string, string>>({})
   const [requestContributionForms, setRequestContributionForms] = useState<Record<string, { donation_id: string; quantity: string }>>({})
-  const [donationCertificates, setDonationCertificates] = useState<DonationCertificate[]>([])
   const [milestoneCertificates, setMilestoneCertificates] = useState<DonationCertificate[]>([])
   const [completedDonationCount, setCompletedDonationCount] = useState(0)
-  const [nextMilestone, setNextMilestone] = useState<DonationMilestoneProgress | null>(null)
   const [certificateDataLoaded, setCertificateDataLoaded] = useState(false)
   const [certificatesLoading, setCertificatesLoading] = useState(true)
   const [certificatesError, setCertificatesError] = useState('')
@@ -2773,9 +2780,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
     let active = true
     let fetching = false
     setMilestoneCertificates([])
-    setDonationCertificates([])
     setCompletedDonationCount(0)
-    setNextMilestone(null)
     setCertificateDataLoaded(false)
     setCertificatesLoading(true)
     setCertificatesError('')
@@ -2787,12 +2792,8 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
         if (!active) return
         const earnedMilestones = ((response.milestone_certificates || []) as DonationCertificate[])
           .filter((certificate) => certificate.certificate_type === 'milestone' && Boolean(certificate.milestone))
-        const earnedDonations = ((response.donation_certificates || []) as DonationCertificate[])
-          .filter((certificate) => certificate.certificate_type === 'donation' || Boolean(certificate.donation_id && !certificate.milestone))
-        setDonationCertificates(earnedDonations)
         setMilestoneCertificates(earnedMilestones)
         setCompletedDonationCount(Number(response.completed_donations) || 0)
-        setNextMilestone((response.next_milestone as DonationMilestoneProgress | null) || null)
         setCertificateDataLoaded(true)
         setCertificatesError('')
       } catch (error) {
@@ -2811,6 +2812,50 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
     }
   }, [certificateRetryToken, donationCompletionSignature, user.id])
 
+  useEffect(() => {
+    let active = true
+    apiRequest('/donor/delivery-issues')
+      .then((response) => {
+        if (!active) return
+        setDeliveryIssues(response.issues || [])
+        setReportableDeliveries(response.reportable_deliveries || [])
+      })
+      .catch((error) => {
+        if (active) setDeliveryIssuesError(error instanceof Error ? error.message : 'Unable to load delivery issues.')
+      })
+      .finally(() => {
+        if (active) setDeliveryIssuesLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [deliveryIssuesRefresh, user.id])
+
+  const submitDonorDeliveryIssue = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!deliveryIssueTaskId || !deliveryIssueDescription.trim()) return
+    setSubmittingDeliveryIssue(true)
+    setDeliveryIssuesError('')
+    try {
+      const response = await apiRequest(`/delivery-tasks/${encodeURIComponent(deliveryIssueTaskId)}/issues`, {
+        method: 'POST',
+        body: JSON.stringify({
+          category: deliveryIssueCategory,
+          description: deliveryIssueDescription.trim(),
+        }),
+      })
+      setDeliveryIssueDescription('')
+      setDeliveryIssueTaskId('')
+      setDeliveryIssuesRefresh((current) => current + 1)
+      await onReload()
+      setMessage(`Issue ${response.issue.id} was reported to the coordinating organization.`)
+    } catch (error) {
+      setDeliveryIssuesError(error instanceof Error ? error.message : 'Unable to submit the delivery issue.')
+    } finally {
+      setSubmittingDeliveryIssue(false)
+    }
+  }
+
   const openCertificate = (certificate: DonationCertificate) => {
     setSelectedCertificate(certificate)
   }
@@ -2821,8 +2866,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
 
   const printCertificate = (certificate: DonationCertificate) => {
     if (isDonorCertificate(certificate)) {
-      const milestoneDonation = donationCertificates.find((item) => item.donation_id === certificate.donation_id)
-      if (!openCertificatePrintWindow(createDonationCertificateHtml(certificate, milestoneDonation), certificate.certificate_id)) {
+      if (!openCertificatePrintWindow(createDonationCertificateHtml(certificate), certificate.certificate_id)) {
         setCertificatesError('Your browser blocked the certificate print window. Allow pop-ups to print or save this certificate.')
       }
       return
@@ -2843,8 +2887,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
     setCertificatesError('')
     try {
       if (isDonorCertificate(certificate)) {
-        const milestoneDonation = donationCertificates.find((item) => item.donation_id === certificate.donation_id)
-        if (!openCertificatePrintWindow(createDonationCertificateHtml(certificate, milestoneDonation), certificate.certificate_id)) {
+        if (!openCertificatePrintWindow(createDonationCertificateHtml(certificate), certificate.certificate_id)) {
           throw new Error('Your browser blocked the certificate print window. Allow pop-ups to print or save this certificate.')
         }
         return
@@ -3258,9 +3301,66 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
         ))}
       </section>
 
+      <section id="donor-delivery-issues" className="section-shell rounded-[28px] p-5">
+        <h2 className="text-xl font-bold text-slate-900">Delivery issues linked to my donations</h2>
+        {message && <p className="mt-2 text-sm text-[#1d4d3d]" role="status">{message}</p>}
+        {deliveryIssuesError && <p className="mt-2 text-sm text-red-700" role="alert">{deliveryIssuesError}</p>}
+        {deliveryIssuesLoading ? (
+          <p className="mt-3 text-sm text-slate-600">Loading reported issues…</p>
+        ) : (
+          <>
+            {deliveryIssues.length ? (
+              <div className="mt-4 space-y-3">
+                {deliveryIssues.map((issue) => (
+                  <article key={issue.id} className="rounded-2xl border border-amber-200 bg-amber-50/40 p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <p className="font-semibold text-slate-900">{issue.category || 'Other'} · {formatStatus(issue.status)}</p>
+                        <p className="mt-1 text-xs text-slate-500">Reported: {new Date(issue.created_at).toLocaleString()}</p>
+                        <p className="mt-1 text-xs text-slate-600">Delivery: {issue.delivery_id} · Request: {issue.request_name || 'Not linked'} ({issue.request_id || '—'}) · Donation: {issue.donation_name || 'Not linked'} ({issue.donation_id || '—'})</p>
+                        <p className="mt-2 whitespace-pre-wrap text-sm text-slate-700">{issue.description}</p>
+                        {issue.resolution_note && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-700"><span className="font-semibold">NGO resolution note:</span> {issue.resolution_note}</p>}
+                      </div>
+                    </div>
+                    {issue.status_history?.length ? (
+                      <ol className="mt-3 flex flex-wrap gap-x-4 gap-y-1 border-t border-amber-200 pt-3 text-xs text-slate-600" aria-label="Issue status history">
+                        {issue.status_history.map((entry, index) => <li key={`${entry.status}-${entry.created_at}-${index}`}>{formatStatus(entry.status)} · {new Date(entry.created_at).toLocaleString()}</li>)}
+                      </ol>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            ) : <p className="mt-3 text-sm text-slate-500">No delivery issues are linked to your donations.</p>}
+            {reportableDeliveries.length > 0 && (
+              <form onSubmit={(event) => void submitDonorDeliveryIssue(event)} className="mt-4 grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 md:grid-cols-2">
+                <label className="text-sm font-semibold text-slate-700">
+                  Delivered donation
+                  <select value={deliveryIssueTaskId} onChange={(event) => setDeliveryIssueTaskId(event.target.value)} className="input-shell mt-1" required>
+                    <option value="">Select a delivered donation</option>
+                    {reportableDeliveries.map((delivery) => <option key={delivery.id} value={delivery.id}>{delivery.food_name || 'Donation'} · {delivery.id}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm font-semibold text-slate-700">
+                  Category
+                  <select value={deliveryIssueCategory} onChange={(event) => setDeliveryIssueCategory(event.target.value)} className="input-shell mt-1">
+                    {['Food quality', 'Packaging', 'Quantity', 'Delivery delay', 'Missing items', 'Other'].map((category) => <option key={category} value={category}>{category}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm font-semibold text-slate-700 md:col-span-2">
+                  Describe the issue
+                  <textarea value={deliveryIssueDescription} onChange={(event) => setDeliveryIssueDescription(event.target.value)} className="input-shell mt-1 min-h-20" maxLength={2000} required />
+                </label>
+                <div className="md:col-span-2 flex justify-end">
+                  <button type="submit" disabled={submittingDeliveryIssue} className="primary-btn px-4 py-2 text-sm font-semibold disabled:opacity-60">{submittingDeliveryIssue ? 'Submitting…' : 'Report an issue'}</button>
+                </div>
+              </form>
+            )}
+          </>
+        )}
+      </section>
+
       <section className="section-shell rounded-[28px] p-5" aria-labelledby="donor-donation-certificates-heading">
         <h3 id="donor-donation-certificates-heading" className="text-xl font-bold text-slate-900">My Donation Certificates</h3>
-        <p className="mt-2 text-sm text-slate-600">Based on {completedDonationCount} completed donation{completedDonationCount === 1 ? '' : 's'} in your saved donation records.</p>
         {certificatesLoading ? (
           <p role="status" className="py-5 text-sm text-slate-600">Loading donation certificates…</p>
         ) : (
@@ -3315,58 +3415,6 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
                       </article>
                     )
                   })}
-                </div>
-
-                <div className="mt-5 border-t border-slate-100 pt-4">
-                  <h4 className="text-base font-bold text-slate-900">Completed donation certificates</h4>
-                  {donationCertificates.length ? (
-                    <div className="mt-3 grid gap-3 md:grid-cols-2">
-                      {donationCertificates.map((certificate) => (
-                        <article key={certificate.id} className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4">
-                          <p className="flex items-center gap-2 font-semibold text-slate-900"><Trophy size={16} className="text-emerald-700" />{certificate.food_name || 'Food donation'}</p>
-                          <p className="mt-1 text-sm text-slate-600">{certificate.quantity} {certificate.quantity_unit} · Delivered {certificateDate(certificate.delivery_date || '')}</p>
-                          <p className="mt-1 text-xs text-slate-500">Reference: {certificate.certificate_id}</p>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            <button type="button" onClick={() => openCertificate(certificate)} className="secondary-btn inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold"><FileText size={14} />Preview</button>
-                            <button type="button" onClick={() => void downloadCertificatePdf(certificate)} disabled={downloadingCertificateId === certificate.id} className="primary-btn inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold disabled:opacity-60"><Download size={14} />{downloadingCertificateId === certificate.id ? 'Preparing…' : 'Download'}</button>
-                          </div>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="mt-2 text-sm text-slate-500">No certificates earned yet. A certificate will appear here when a donation is fully delivered.</p>
-                  )}
-                </div>
-
-                <div className="mt-5 border-t border-slate-100 pt-4">
-                  {nextMilestone ? (
-                    <>
-                      <div className="flex flex-wrap items-end justify-between gap-3">
-                        <div>
-                          <p className="text-xs font-bold uppercase tracking-wide text-[#1d4d3d]">Next milestone</p>
-                          <h4 className="mt-1 text-lg font-bold text-slate-900">{nextMilestone.title.replace(/ Certificate$/, '')}</h4>
-                        </div>
-                        <p className="text-sm font-semibold text-slate-700">
-                          {nextMilestone.remaining_donations} more {nextMilestone.remaining_donations === 1 ? 'donation' : 'donations'} needed
-                        </p>
-                      </div>
-                      <p className="mt-2 text-sm text-slate-600">
-                        {Math.min(completedDonationCount, nextMilestone.required_donations)} of {nextMilestone.required_donations} completed donations
-                      </p>
-                      <div
-                        className="mt-3 h-2.5 overflow-hidden rounded-full bg-slate-200"
-                        role="progressbar"
-                        aria-label={`${nextMilestone.title} progress`}
-                        aria-valuemin={0}
-                        aria-valuemax={nextMilestone.required_donations}
-                        aria-valuenow={Math.min(completedDonationCount, nextMilestone.required_donations)}
-                      >
-                        <div className="h-full rounded-full bg-[#1d4d3d] transition-[width] duration-500" style={{ width: `${nextMilestone.progress_percent}%` }} />
-                      </div>
-                    </>
-                  ) : (
-                    <p className="text-sm font-semibold text-[#1d4d3d]">All donation certificate milestones have been achieved.</p>
-                  )}
                 </div>
 
               </>
@@ -3869,10 +3917,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, onReload }
               {isDonorCertificate(selectedCertificate) ? (
                 <iframe
                   title={`Certificate of Appreciation for ${selectedCertificate.donor_name}`}
-                  srcDoc={createDonationCertificateHtml(
-                    selectedCertificate,
-                    donationCertificates.find((item) => item.donation_id === selectedCertificate.donation_id),
-                  )}
+                  srcDoc={createDonationCertificateHtml(selectedCertificate)}
                   className="mx-auto block border-0 shadow-lg"
                   style={{ width: 'min(100%, calc(68vh * 1.4142))', aspectRatio: '297 / 210' }}
                 />
@@ -5300,9 +5345,9 @@ function NgoDashboard({
                   <label className="text-xs font-semibold text-slate-700">
                     Issue status
                     <select value={issueStatusDrafts[issue.id] || issue.status} onChange={(event) => setIssueStatusDrafts((current) => ({ ...current, [issue.id]: event.target.value as DeliveryIssue['status'] }))} className="input-shell mt-1">
-                      <option value="open">Open</option>
-                      <option value="under_review">Under Review</option>
-                      <option value="resolved">Resolved</option>
+                      <option value="open" disabled={issue.status !== 'open'}>Open</option>
+                      <option value="under_review" disabled={issue.status !== 'open' && issue.status !== 'under_review'}>Under Review</option>
+                      <option value="resolved" disabled={issue.status !== 'under_review' && issue.status !== 'resolved'}>Resolved</option>
                     </select>
                   </label>
                   <label className="min-w-56 flex-1 text-xs font-semibold text-slate-700">
