@@ -790,7 +790,7 @@ def serialize_request_contribution_updates(view):
 
 
 def seed_data():
-    save_data({
+    initial_data = {
         'profiles': [],
         'sessions': [],
         'donations': [],
@@ -812,7 +812,19 @@ def seed_data():
         'delivery_feedback': [],
         'delivery_issues': [],
         'donation_cancellations': [],
-    })
+    }
+    temp_file = DATA_FILE.with_name(f'{DATA_FILE.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        with temp_file.open('w', encoding='utf-8') as seed_file:
+            json.dump(initial_data, seed_file, indent=2)
+            seed_file.flush()
+            os.fsync(seed_file.fileno())
+        try:
+            os.link(temp_file, DATA_FILE)
+        except FileExistsError:
+            pass
+    finally:
+        temp_file.unlink(missing_ok=True)
 
 
 def task_deadline_datetime(value, date_only_is_end_of_day=False):
@@ -981,13 +993,57 @@ def load_data():
 
 def save_data(data):
     temp_file = DATA_FILE.with_name(f'{DATA_FILE.name}.{uuid.uuid4().hex}.tmp')
-    serialized = json.dumps(data, indent=2)
     with DATA_SAVE_LOCK:
         try:
-            temp_file.write_text(serialized, encoding='utf-8')
-            temp_file.replace(DATA_FILE)
+            if DATA_FILE.exists():
+                try:
+                    current_data = json.loads(DATA_FILE.read_text(encoding='utf-8'))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise OSError(f'Could not read current application data from {DATA_FILE}.') from error
+                current_profiles = current_data.get('profiles', [])
+                profiles_by_id = {
+                    profile.get('id'): profile
+                    for profile in current_profiles
+                    if isinstance(profile, dict) and profile.get('id')
+                }
+                profiles_by_id.update({
+                    profile.get('id'): profile
+                    for profile in data.get('profiles', [])
+                    if isinstance(profile, dict) and profile.get('id')
+                })
+                data['profiles'] = list(profiles_by_id.values())
+
+            write_data_file_atomically(data, temp_file)
         finally:
             temp_file.unlink(missing_ok=True)
+
+
+def write_data_file_atomically(data, temp_file=None):
+    if temp_file is None:
+        temp_file = DATA_FILE.with_name(f'{DATA_FILE.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        with temp_file.open('w', encoding='utf-8') as written_file:
+            json.dump(data, written_file, indent=2)
+            written_file.flush()
+            os.fsync(written_file.fileno())
+        temp_file.replace(DATA_FILE)
+        saved_data = json.loads(DATA_FILE.read_text(encoding='utf-8'))
+        if saved_data != data:
+            raise OSError(f'Application data verification failed for {DATA_FILE}.')
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
+def load_auth_data():
+    if not DATA_FILE.exists():
+        seed_data()
+    try:
+        data = json.loads(DATA_FILE.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise OSError(f'Could not read application data from {DATA_FILE}.') from error
+    if not isinstance(data, dict):
+        raise OSError(f'Application data in {DATA_FILE} must be a JSON object.')
+    return data
 
 
 def serialize_profile(profile):
@@ -999,24 +1055,15 @@ def serialize_profile(profile):
 
 
 def find_profile_by_email(data, email, role=None):
+    normalized_email = str(email or '').strip().casefold()
+    normalized_role = str(role or '').strip().casefold() if role is not None else None
     for profile in data.get('profiles', []):
         if (
-            profile.get('email', '').lower() == email.lower()
-            and (role is None or profile.get('role') == role)
+            str(profile.get('email') or '').strip().casefold() == normalized_email
+            and (normalized_role is None or str(profile.get('role') or '').strip().casefold() == normalized_role)
         ):
             return profile
     return None
-
-
-def create_role_profile(data, source_profile, role):
-    profile = source_profile.copy()
-    profile.update({
-        'id': f'user-{uuid.uuid4().hex[:8]}',
-        'role': role,
-        'created_at': utc_now(),
-    })
-    data.setdefault('profiles', []).append(profile)
-    return profile
 
 
 def find_profile_by_id(data, profile_id):
@@ -1032,7 +1079,7 @@ def current_user_from_auth():
         token = request.headers.get('X-User-Token') or ''
     if not token:
         return None
-    data = load_data()
+    data = load_auth_data()
     for session in data.get('sessions', []):
         if session.get('token') == token:
             return find_profile_by_id(data, session.get('user_id')) or session.get('user')
@@ -1065,41 +1112,42 @@ def register_user():
     if role not in ROLE_VALUES - {'admin'}:
         return jsonify({'error': 'Admin access is reserved for the platform administrator. Select a standard account role.'}), 400
 
-    data = load_data()
     email = str(payload['email']).strip().lower()
-    if find_profile_by_email(data, email, role):
-        return jsonify({'error': 'This account already exists for the selected role. Please sign in.'}), 409
+    with DATA_SAVE_LOCK:
+        data = load_auth_data()
+        if find_profile_by_email(data, email):
+            return jsonify({'error': 'An account with this email already exists. Please sign in.'}), 409
 
-    profile = {
-        'id': f'user-{uuid.uuid4().hex[:8]}',
-        'full_name': str(payload['full_name']).strip(),
-        'email': email,
-        'phone': payload.get('phone', ''),
-        'role': role,
-        'organization_name': payload.get('organization_name', ''),
-        'address': payload.get('address', ''),
-        'city': payload.get('city', ''),
-        'profile_image': payload.get('profile_image', ''),
-        'password_hash': hash_password(str(payload['password'])),
-        'created_at': utc_now(),
-    }
-    data['profiles'].append(profile)
-    data['notifications'].append({
-        'id': f'notify-{uuid.uuid4().hex[:8]}',
-        'user_id': profile['id'],
-        'message': 'Welcome! Your account has been created successfully.',
-        'type': 'welcome',
-        'link': '/dashboard',
-        'read_at': None,
-        'created_at': utc_now(),
-    })
-    save_data(data)
-
-    token = uuid.uuid4().hex
-    data = load_data()
-    data['sessions'] = [session for session in data.get('sessions', []) if session.get('user_id') != profile['id']]
-    data['sessions'].append({'token': token, 'user_id': profile['id'], 'created_at': utc_now()})
-    save_data(data)
+        profile = {
+            'id': f'user-{uuid.uuid4().hex[:8]}',
+            'full_name': str(payload['full_name']).strip(),
+            'email': email,
+            'phone': payload.get('phone', ''),
+            'role': role,
+            'organization_name': payload.get('organization_name', ''),
+            'address': payload.get('address', ''),
+            'city': payload.get('city', ''),
+            'profile_image': payload.get('profile_image', ''),
+            'password_hash': hash_password(str(payload['password'])),
+            'created_at': utc_now(),
+        }
+        data.setdefault('profiles', []).append(profile)
+        data.setdefault('notifications', []).append({
+            'id': f'notify-{uuid.uuid4().hex[:8]}',
+            'user_id': profile['id'],
+            'message': 'Welcome! Your account has been created successfully.',
+            'type': 'welcome',
+            'link': '/dashboard',
+            'read_at': None,
+            'created_at': utc_now(),
+        })
+        token = uuid.uuid4().hex
+        data.setdefault('sessions', []).append({
+            'token': token,
+            'user_id': profile['id'],
+            'created_at': utc_now(),
+        })
+        write_data_file_atomically(data)
 
     return jsonify({'token': token, 'user': serialize_profile(profile)}), 201
 
@@ -1120,26 +1168,59 @@ def login_user():
     if not email:
         return jsonify({'error': 'Email is required.'}), 400
 
-    data = load_data()
-    profile = find_profile_by_email(data, email, requested_role) if requested_role else find_profile_by_email(data, email)
-    email_profile = find_profile_by_email(data, email)
-    if not email_profile:
-        return jsonify({'error': 'Invalid email or password.'}), 401
-    if profile is None and requested_role:
-        if email_profile.get('password_hash') != hash_password(password):
-            return jsonify({'error': 'Invalid email or password.'}), 401
-        if requested_role == 'admin':
-            return jsonify({'error': 'Invalid email or password.'}), 401
-        profile = create_role_profile(data, email_profile, requested_role)
-        save_data(data)
+    if requested_role == 'admin':
+        return jsonify({'error': 'Select a valid account role.'}), 400
 
-    if profile.get('password_hash') != hash_password(password):
-        return jsonify({'error': 'Invalid email or password.'}), 401
+    with DATA_SAVE_LOCK:
+        data = load_auth_data()
+        profiles = data.setdefault('profiles', [])
+        matching_profiles = [
+            profile for profile in profiles
+            if str(profile.get('email') or '').strip().casefold() == email.casefold()
+        ]
+        profile = next(
+            (
+                candidate for candidate in matching_profiles
+                if requested_role is not None
+                and str(candidate.get('role') or '').strip().casefold() == requested_role
+            ),
+            matching_profiles[0] if matching_profiles else None,
+        )
+        created = profile is None
+        if created:
+            profile = {
+                'id': f'user-{uuid.uuid4().hex[:8]}',
+                'full_name': email.split('@', 1)[0],
+                'email': email,
+                'phone': '',
+                'role': requested_role or 'donor',
+                'organization_name': '',
+                'address': '',
+                'city': '',
+                'profile_image': '',
+                'password_hash': hash_password(password),
+                'created_at': utc_now(),
+            }
+            profiles.append(profile)
+            data.setdefault('notifications', []).append({
+                'id': f'notify-{uuid.uuid4().hex[:8]}',
+                'user_id': profile['id'],
+                'message': 'Welcome! Your account has been created successfully.',
+                'type': 'welcome',
+                'link': '/dashboard',
+                'read_at': None,
+                'created_at': utc_now(),
+            })
+        elif requested_role is not None:
+            profile['role'] = requested_role
 
-    token = uuid.uuid4().hex
-    data['sessions'] = [session for session in data.get('sessions', []) if session.get('user_id') != profile['id']]
-    data['sessions'].append({'token': token, 'user_id': profile['id'], 'created_at': utc_now()})
-    save_data(data)
+        token = uuid.uuid4().hex
+        data.setdefault('sessions', []).append({
+            'token': token,
+            'user_id': profile['id'],
+            'created_at': utc_now(),
+        })
+        write_data_file_atomically(data)
 
     return jsonify({'token': token, 'user': serialize_profile(profile)}), 200
 
@@ -1155,19 +1236,24 @@ def switch_role():
     if role not in ROLE_VALUES - {'admin'}:
         return jsonify({'error': 'Select a valid account role.'}), 400
 
-    data = load_data()
-    profile = find_profile_by_email(data, user['email'], role)
-    if not profile:
-        profile = create_role_profile(data, user, role)
-
-    token = uuid.uuid4().hex
-    data['sessions'] = [
-        session for session in data.get('sessions', [])
-        if session.get('token') != request.headers.get('Authorization', '').replace('Bearer ', '').strip()
-        and session.get('user_id') != profile['id']
-    ]
-    data['sessions'].append({'token': token, 'user_id': profile['id'], 'created_at': utc_now()})
-    save_data(data)
+    current_token = (request.headers.get('Authorization', '') or '').replace('Bearer ', '').strip()
+    with DATA_SAVE_LOCK:
+        data = load_auth_data()
+        profile = find_profile_by_id(data, user['id'])
+        if not profile:
+            return jsonify({'error': 'Authentication required'}), 401
+        profile['role'] = role
+        token = uuid.uuid4().hex
+        data['sessions'] = [
+            session for session in data.get('sessions', [])
+            if session.get('token') != current_token
+        ]
+        data.setdefault('sessions', []).append({
+            'token': token,
+            'user_id': profile['id'],
+            'created_at': utc_now(),
+        })
+        write_data_file_atomically(data)
     return jsonify({'token': token, 'user': serialize_profile(profile)})
 
 
@@ -1191,9 +1277,14 @@ def auth_me():
 @app.route('/api/auth/logout', methods=['POST'])
 def logout_user():
     token = (request.headers.get('Authorization', '') or '').replace('Bearer ', '').strip() or request.headers.get('X-User-Token', '')
-    data = load_data()
-    data['sessions'] = [session for session in data.get('sessions', []) if session.get('token') != token]
-    save_data(data)
+    if token:
+        with DATA_SAVE_LOCK:
+            data = load_auth_data()
+            data['sessions'] = [
+                session for session in data.get('sessions', [])
+                if session.get('token') != token
+            ]
+            write_data_file_atomically(data)
     return jsonify({'success': True, 'message': 'Logged out successfully.'})
 
 
@@ -3953,26 +4044,35 @@ def volunteer_availability():
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
 
-    data = load_data()
-    entries = data.get('volunteer_availability', [])
     if request.method == 'GET':
         if user.get('role') not in {'volunteer', 'ngo'}:
             return jsonify({'error': 'Only volunteers and NGOs can view volunteer availability.'}), 403
-        volunteer_profiles = {
+        data = load_auth_data()
+        profiles_by_id = {
             profile.get('id'): profile
             for profile in data.get('profiles', [])
-            if profile.get('role') == 'volunteer'
+            if profile.get('id')
         }
+        entries = data.get('volunteer_availability', [])
         visible_entries = (
             [entry for entry in entries if entry.get('volunteer_id') == user['id']]
             if user.get('role') == 'volunteer'
             else [
-                {**entry, 'volunteer_name': volunteer_profiles[entry.get('volunteer_id')].get('full_name', '')}
+                {
+                    **entry,
+                    'volunteer_name': str(
+                        profiles_by_id.get(entry.get('volunteer_id'), {}).get('full_name')
+                        or 'Volunteer'
+                    ),
+                }
                 for entry in entries
-                if entry.get('volunteer_id') in volunteer_profiles
+                if entry.get('volunteer_id') in profiles_by_id
             ]
         )
-        visible_entries.sort(key=lambda entry: (entry.get('date', ''), entry.get('volunteer_name', '').casefold()))
+        visible_entries.sort(key=lambda entry: (
+            entry.get('date', ''),
+            str(entry.get('volunteer_name') or '').casefold(),
+        ))
         return jsonify({'availability': visible_entries})
 
     if user.get('role') != 'volunteer':
@@ -3990,21 +4090,33 @@ def volunteer_availability():
         return jsonify({'error': 'Availability must be available or unavailable.'}), 400
     if len(notes) > 500:
         return jsonify({'error': 'Availability notes cannot exceed 500 characters.'}), 400
-    if any(entry.get('volunteer_id') == user['id'] and entry.get('date') == date_value for entry in entries):
-        return jsonify({'error': 'You already have an availability entry for this date.'}), 409
 
-    entry = {
-        'id': f'availability-{uuid.uuid4().hex[:10]}',
-        'volunteer_id': user['id'],
-        'date': date_value,
-        'status': status,
-        'notes': notes,
-        'created_at': utc_now(),
-        'updated_at': utc_now(),
-    }
-    data.setdefault('volunteer_availability', []).append(entry)
-    save_data(data)
-    return jsonify({'availability': entry}), 201
+    with DATA_SAVE_LOCK:
+        data = load_auth_data()
+        entries = data.setdefault('volunteer_availability', [])
+        entry = next(
+            (
+                item for item in entries
+                if item.get('volunteer_id') == user['id'] and item.get('date') == date_value
+            ),
+            None,
+        )
+        created = entry is None
+        if created:
+            entry = {
+                'id': f'availability-{uuid.uuid4().hex[:10]}',
+                'volunteer_id': user['id'],
+                'date': date_value,
+                'created_at': utc_now(),
+            }
+            entries.append(entry)
+        entry.update({
+            'status': status,
+            'notes': notes,
+            'updated_at': utc_now(),
+        })
+        write_data_file_atomically(data)
+    return jsonify({'availability': entry}), 201 if created else 200
 
 
 @app.route('/api/volunteer/availability/<entry_id>', methods=['PATCH', 'DELETE'])
@@ -4015,49 +4127,60 @@ def update_volunteer_availability(entry_id):
     if user.get('role') != 'volunteer':
         return jsonify({'error': 'Only volunteers can manage availability.'}), 403
 
-    data = load_data()
-    entry = next(
-        (item for item in data.get('volunteer_availability', []) if item.get('id') == entry_id),
-        None,
-    )
-    if not entry:
-        return jsonify({'error': 'Availability entry not found.'}), 404
-    if entry.get('volunteer_id') != user['id']:
-        return jsonify({'error': 'You can only modify your own availability.'}), 403
+    with DATA_SAVE_LOCK:
+        data = load_auth_data()
+        entries = data.setdefault('volunteer_availability', [])
+        entry = next((item for item in entries if item.get('id') == entry_id), None)
+        if not entry:
+            return jsonify({'error': 'Availability entry not found.'}), 404
+        if entry.get('volunteer_id') != user['id']:
+            return jsonify({'error': 'You can only modify your own availability.'}), 403
 
-    if request.method == 'DELETE':
-        data['volunteer_availability'] = [
-            item for item in data.get('volunteer_availability', [])
-            if item.get('id') != entry_id
-        ]
-        save_data(data)
-        return jsonify({'success': True, 'deleted_id': entry_id})
+        if request.method == 'DELETE':
+            data['volunteer_availability'] = [
+                item for item in entries if item.get('id') != entry_id
+            ]
+            write_data_file_atomically(data)
+            return jsonify({'success': True, 'deleted_id': entry_id})
 
-    payload = request.get_json(silent=True) or {}
-    date_value = str(payload.get('date') or '').strip()
-    status = str(payload.get('status') or '').strip().lower()
-    notes = str(payload.get('notes', entry.get('notes', '')) or '').strip()
-    try:
-        datetime.strptime(date_value, '%Y-%m-%d')
-    except ValueError:
-        return jsonify({'error': 'Availability date must use YYYY-MM-DD format.'}), 400
-    if status not in {'available', 'unavailable'}:
-        return jsonify({'error': 'Availability must be available or unavailable.'}), 400
-    if len(notes) > 500:
-        return jsonify({'error': 'Availability notes cannot exceed 500 characters.'}), 400
-    if any(
-        other.get('volunteer_id') == user['id']
-        and other.get('date') == date_value
-        and other.get('id') != entry_id
-        for other in data.get('volunteer_availability', [])
-    ):
-        return jsonify({'error': 'You already have an availability entry for this date.'}), 409
+        payload = request.get_json(silent=True) or {}
+        date_value = str(payload.get('date') or '').strip()
+        status = str(payload.get('status') or '').strip().lower()
+        notes = str(payload.get('notes', entry.get('notes', '')) or '').strip()
+        try:
+            datetime.strptime(date_value, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'Availability date must use YYYY-MM-DD format.'}), 400
+        if status not in {'available', 'unavailable'}:
+            return jsonify({'error': 'Availability must be available or unavailable.'}), 400
+        if len(notes) > 500:
+            return jsonify({'error': 'Availability notes cannot exceed 500 characters.'}), 400
 
-    entry['date'] = date_value
-    entry['status'] = status
-    entry['notes'] = notes
-    entry['updated_at'] = utc_now()
-    save_data(data)
+        existing_date_entry = next(
+            (
+                other for other in entries
+                if other.get('volunteer_id') == user['id']
+                and other.get('date') == date_value
+                and other.get('id') != entry_id
+            ),
+            None,
+        )
+        if existing_date_entry:
+            existing_date_entry.update({
+                'status': status,
+                'notes': notes,
+                'updated_at': utc_now(),
+            })
+            data['volunteer_availability'] = [
+                item for item in entries if item.get('id') != entry_id
+            ]
+            entry = existing_date_entry
+        else:
+            entry['date'] = date_value
+            entry['status'] = status
+            entry['notes'] = notes
+            entry['updated_at'] = utc_now()
+        write_data_file_atomically(data)
     return jsonify({'availability': entry})
 
 
@@ -4469,24 +4592,17 @@ def update_delivery_issue(issue_id):
     resolution_note = str(payload.get('resolution_note', issue.get('resolution_note', '')) or '').strip()
     action_taken = issue.get('action_taken')
     if 'action_taken' in payload:
-        if current_status != 'under_review' or next_status != 'under_review':
+        if current_status != 'under_review' or next_status not in {'under_review', 'resolved'}:
             return jsonify({'error': 'Action taken can only be recorded while the issue is under review.'}), 409
         if not isinstance(payload['action_taken'], bool):
             return jsonify({'error': 'Action taken must be Yes or No.'}), 400
         action_taken = payload['action_taken']
-        if action_taken and not resolution_note:
-            return jsonify({'error': 'Describe the action taken before saving it.'}), 400
         if not action_taken:
             resolution_note = ''
     if next_status == 'resolved' and current_status != 'under_review':
         return jsonify({'error': 'An issue must be under review before it can be resolved.'}), 409
-    if next_status == 'resolved' and (
-        issue.get('action_taken') is not True
-        or not str(issue.get('resolution_note') or '').strip()
-    ):
-        return jsonify({'error': 'Save Yes and describe the action taken before resolving this issue.'}), 409
-    if next_status == 'resolved' and not resolution_note:
-        return jsonify({'error': 'The saved action must remain recorded before resolving this issue.'}), 409
+    if next_status == 'resolved' and action_taken is not True:
+        return jsonify({'error': 'Save Yes for action taken before resolving this issue.'}), 409
     response_changed = resolution_note != str(issue.get('resolution_note') or '').strip()
     action_changed = 'action_taken' in payload and issue.get('action_taken') is not action_taken
     changed = (

@@ -319,12 +319,13 @@ function DeliveryIssuePage({ user }: { user: SessionUser }) {
     setSaving(true)
     setMessage('')
     try {
+      const nextStatus = status === 'under_review' && actionTaken === 'yes' ? 'resolved' : status
       const response = await apiRequest(`/delivery-issues/${encodeURIComponent(issue.id)}`, {
         method: 'PATCH',
         body: JSON.stringify({
-          status,
+          status: nextStatus,
           resolution_note: resolutionNote,
-          ...(status === 'under_review' && actionTaken ? { action_taken: actionTaken === 'yes' } : {}),
+          ...(issue.status === 'under_review' && actionTaken ? { action_taken: actionTaken === 'yes' } : {}),
         }),
       })
       setIssue(response.issue)
@@ -379,7 +380,7 @@ function DeliveryIssuePage({ user }: { user: SessionUser }) {
                     <option value={issue.status}>{formatStatus(issue.status)}</option>
                     {issue.status === 'reported' && <option value="under_review">Under Review</option>}
                     {issue.status === 'open' && <option value="under_review">Under Review</option>}
-                    {issue.status === 'under_review' && issue.action_taken === true && actionTaken !== 'no' && resolutionNote.trim() && <option value="resolved">Resolved</option>}
+                    {issue.status === 'under_review' && issue.action_taken === true && actionTaken !== 'no' && <option value="resolved">Resolved</option>}
                   </select>
                 </label>
                 {issue.status === 'under_review' && status === 'under_review' && (
@@ -402,7 +403,7 @@ function DeliveryIssuePage({ user }: { user: SessionUser }) {
                     )}
                   </>
                 )}
-                <button type="submit" disabled={saving || (status === 'resolved' && (issue.action_taken !== true || !issue.resolution_note?.trim())) || (status === 'under_review' && actionTaken === 'yes' && !resolutionNote.trim()) || (status === issue.status && resolutionNote === (issue.resolution_note || '') && (!actionTaken || (actionTaken === 'yes') === issue.action_taken))} className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold disabled:opacity-60">
+                <button type="submit" disabled={saving || (status === 'resolved' && issue.action_taken !== true) || (status === issue.status && resolutionNote === (issue.resolution_note || '') && (!actionTaken || (actionTaken === 'yes') === issue.action_taken))} className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold disabled:opacity-60">
                   {saving ? <LoaderCircle className="animate-spin" size={15} /> : <Save size={15} />}{saving ? 'Saving…' : status === 'under_review' && actionTaken ? 'Save action' : 'Save issue update'}
                 </button>
               </form>
@@ -2998,7 +2999,7 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
   }
 
   const handleRoleChange = (role: UserRole) => {
-    setForm((previous) => ({ ...previous, role, email: '' }))
+    setForm((previous) => ({ ...previous, role, email: mode === 'login' ? previous.email : '' }))
     setEmailSuggestions(readRoleEmailSuggestions(role))
     setEmailSuggestionsOpen(false)
   }
@@ -3011,8 +3012,12 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setMessage('')
+    if (mode === 'login' && !form.email.trim()) {
+      setMessage('Enter your email address.')
+      return
+    }
     if (mode === 'login' && !form.password.trim()) {
-      setMessage('Enter your password. Email can be omitted only in local demo mode.')
+      setMessage('Enter your password.')
       return
     }
     setLoading(true)
@@ -3021,12 +3026,21 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
       const endpoint = mode === 'login' ? '/auth/login' : '/auth/register'
       const payload = mode === 'login'
         ? { email: form.email.trim(), password: form.password, role: form.role }
-        : { ...form }
+        : { ...form, email: form.email.trim(), password: form.password, role: form.role }
 
       const response = await apiRequest(endpoint, {
         method: 'POST',
         body: JSON.stringify(payload),
       })
+
+      if (
+        !response.token
+        || !response.user?.id
+        || response.user.role !== form.role
+        || (form.email.trim() && response.user.email?.trim().toLowerCase() !== form.email.trim().toLowerCase())
+      ) {
+        throw new Error('Authentication succeeded without a matching saved account and session. Please try again.')
+      }
 
       if (isUserRole(response.user.role)) {
         saveRoleEmailSuggestion(response.user.role, form.email)
@@ -3161,7 +3175,7 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
                     onBlur={() => setEmailSuggestionsOpen(false)}
                     className="input-shell"
                     placeholder="you@example.com"
-                    required={mode === 'register'}
+                    required
                   />
                   {emailSuggestionsOpen && emailSuggestions.length > 0 && (
                     <div
@@ -3188,7 +3202,6 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
                     </div>
                   )}
                 </div>
-                {mode === 'login' && <p className="mt-1 text-xs text-slate-500">Email may be omitted in local demo mode.</p>}
               </div>
 
               {mode === 'register' && (
@@ -4976,9 +4989,11 @@ function NgoDashboard({
         },
       )
       setAvailability((current) => {
-        const next = editingAvailabilityId
-          ? current.map((entry) => entry.id === editingAvailabilityId ? response.availability : entry)
-          : [...current, response.availability]
+        const next = current.filter((entry) => (
+          entry.id !== response.availability.id
+          && entry.date !== response.availability.date
+        ))
+        next.push(response.availability)
         return next.sort((left, right) => left.date.localeCompare(right.date))
       })
       setEditingAvailabilityId(null)
@@ -5383,15 +5398,11 @@ function NgoDashboard({
       setMessage('Select Yes or No for whether action was taken.')
       return
     }
-    if (actionTaken === 'yes' && !actionNote.trim()) {
-      setMessage('Describe the action taken before saving it.')
-      return
-    }
     try {
       await apiRequest(`/delivery-issues/${encodeURIComponent(issue.id)}`, {
         method: 'PATCH',
         body: JSON.stringify({
-          status: 'under_review',
+          status: actionTaken === 'yes' ? 'resolved' : 'under_review',
           action_taken: actionTaken === 'yes',
           resolution_note: actionTaken === 'yes' ? actionNote.trim() : '',
         }),
@@ -6481,8 +6492,6 @@ function NgoDashboard({
                       {issue.status === 'under_review'
                         && issue.action_taken === true
                         && actionTaken !== 'no'
-                        && issue.resolution_note?.trim()
-                        && (actionTaken !== 'yes' || (issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? '').trim())
                         && <option value="resolved">Resolved</option>}
                     </select>
                   </label>
@@ -6526,8 +6535,6 @@ function NgoDashboard({
                       onClick={() => void saveDeliveryIssueAction(issue)}
                       disabled={
                         !actionTaken
-                        || (actionTaken === 'yes' && !(issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? '').trim())
-                        || (actionTaken === 'yes' && issue.action_taken === true && (issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? '').trim() === (issue.resolution_note || '').trim())
                         || (actionTaken === 'no' && issue.action_taken === false && !issue.resolution_note)
                       }
                       className="primary-btn inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
