@@ -4,24 +4,66 @@
   font-family: 'Inter', 'Segoe UI', sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #0f172a;
-  background: #f3f7f0;
+  color: #24312b;
+  background: #f8f7f2;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  --amber: #d9a441;
+  --critical: #c97979;
+  --information: #7fa6c9;
+  --success: #16a34a;
+  --pending: #d6a15c;
   --forest: #1d4d3d;
   --forest-dark: #123126;
   --forest-soft: #edf8ef;
-  --orange: #f59e0b;
-  --orange-soft: #fff4df;
-  --bg: #f4f7f1;
-  --card: #ffffff;
-  --muted: #64748b;
-  --line: #e2e8f0;
-  --success: #16a34a;
-  --danger: #dc2626;
-  --shadow: 0 18px 45px rgba(18, 49, 38, 0.1);
+  --orange: #d6a15c;
+  --orange-soft: #f8eedc;
+  --bg: #f8f7f2;
+  --card: #fffdf7;
+  --muted: #5f6c65;
+  --line: #e5e4dc;
+  --danger: #a95353;
+  --shadow: 0 18px 45px rgba(49, 64, 51, 0.09);
+}
+
+@theme {
+  --color-amber-50: #fbf5e8;
+  --color-amber-100: #f4e8c9;
+  --color-amber-200: #ead39a;
+  --color-amber-500: #d9a441;
+  --color-amber-700: #8d6722;
+  --color-amber-800: #6f511c;
+  --color-amber-900: #594216;
+  --color-orange-50: #fbf2e6;
+  --color-orange-100: #f4e4ca;
+  --color-orange-200: #e9cda2;
+  --color-orange-500: #d6a15c;
+  --color-orange-700: #8b6230;
+  --color-orange-800: #704f27;
+  --color-orange-900: #593f21;
+  --color-red-50: #f8eeee;
+  --color-red-100: #f0dada;
+  --color-red-200: #e3bcbc;
+  --color-red-500: #c97979;
+  --color-red-700: #914e4e;
+  --color-red-800: #753f3f;
+  --color-red-900: #603535;
+  --color-rose-50: #f8eeee;
+  --color-rose-100: #f0dada;
+  --color-rose-200: #e3bcbc;
+  --color-rose-500: #c97979;
+  --color-rose-700: #914e4e;
+  --color-rose-800: #753f3f;
+  --color-rose-900: #603535;
+  --color-blue-50: #eef4f9;
+  --color-blue-100: #dae7f2;
+  --color-blue-200: #bfd4e7;
+  --color-blue-500: #7fa6c9;
+  --color-blue-700: #4c7093;
+  --color-blue-800: #3d5b78;
+  --color-blue-900: #304861;
 }
 
 html {
@@ -32,8 +74,8 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: linear-gradient(180deg, #f7fbf6 0%, #eef6ee 100%);
-  color: #0f172a;
+  background: linear-gradient(180deg, #fbfaf6 0%, #f3f2e9 100%);
+  color: #24312b;
 }
 
 * {
@@ -57,8 +99,8 @@ img {
 }
 
 .card-surface {
-  background: rgba(255, 255, 255, 0.88);
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(255, 253, 247, 0.94);
+  border: 1px solid rgba(121, 134, 120, 0.2);
   box-shadow: var(--shadow);
   backdrop-filter: blur(12px);
 }
@@ -111,7 +153,7 @@ img {
 }
 
 .glow-ring {
-  box-shadow: 0 0 0 8px rgba(251, 146, 60, 0.08);
+  box-shadow: 0 0 0 8px rgba(217, 164, 65, 0.12);
 }
 
 .text-muted {
@@ -121,7 +163,7 @@ img {
 .input-shell {
   width: 100%;
   border: 1px solid rgba(148, 163, 184, 0.4);
-  background: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 253, 247, 0.92);
   border-radius: 14px;
   padding: 0.85rem 1rem;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
@@ -134,7 +176,73 @@ img {
 }
 
 .section-shell {
-  background: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 253, 247, 0.94);
   border: 1px solid rgba(148, 163, 184, 0.18);
+  box-shadow: 0 12px 32px rgba(49, 64, 51, 0.06);
+}
+
+.bg-white {
+  background-color: var(--card);
+}
+
+[class~="bg-[#ffffff]"] {
+  background-color: var(--card);
+}
+
+[class~="bg-[#f4f7f1]"] {
+  background-color: var(--bg);
+}
+
+.landing-page {
+  --forest: #1d4d3d;
+  --forest-dark: #123126;
+  --forest-soft: #edf8ef;
+  background-color: #f4f7f1;
+}
+
+.landing-page .primary-btn {
+  background: linear-gradient(135deg, var(--forest) 0%, #2a6a52 100%);
+  color: #fff;
+  box-shadow: 0 10px 25px rgba(29, 77, 61, 0.22);
+}
+
+.landing-page .primary-btn:hover {
+  background: linear-gradient(135deg, var(--forest) 0%, #2a6a52 100%);
+  box-shadow: 0 16px 30px rgba(29, 77, 61, 0.3);
+}
+
+.landing-page .secondary-btn {
+  background: #fff;
+  color: var(--forest);
+  border-color: rgba(29, 77, 61, 0.2);
+}
+
+.landing-page .secondary-btn:hover {
+  background: #f8fafc;
+  border-color: rgba(29, 77, 61, 0.45);
+}
+
+.landing-page .card-surface {
+  background: rgba(255, 255, 255, 0.88);
+  border-color: rgba(148, 163, 184, 0.2);
+  box-shadow: 0 18px 45px rgba(18, 49, 38, 0.1);
+}
+
+.landing-page .section-shell {
+  background: rgba(255, 255, 255, 0.85);
+  border-color: rgba(148, 163, 184, 0.18);
   box-shadow: 0 12px 32px rgba(15, 23, 42, 0.06);
+}
+
+.landing-page .bg-white,
+.landing-page [class~="bg-[#ffffff]"] {
+  background-color: #fff;
+}
+
+.landing-page .text-\[\#1d4d3d\] {
+  color: #1d4d3d;
+}
+
+.landing-page .bg-\[\#edf8ef\] {
+  background-color: #edf8ef;
 }

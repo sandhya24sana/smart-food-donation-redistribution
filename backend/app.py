@@ -1,25 +1,49 @@
-import base64
-import binascii
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.pdfgen import canvas
+from reportlab.platypus import Paragraph
+from xml.sax.saxutils import escape
 
 load_dotenv(Path(__file__).resolve().parents[1] / '.env')
 
 app = Flask(__name__)
-CORS(app, resources={r'/api/*': {'origins': '*'}})
+CORS(
+    app,
+    resources={
+        r'/api/*': {
+            'origins': [
+                'http://localhost:5173',
+                'http://localhost:5174',
+                'http://localhost:5175',
+                'http://127.0.0.1:5173',
+                'http://127.0.0.1:5174',
+                'http://127.0.0.1:5175',
+            ],
+            'methods': ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+            'allow_headers': ['Content-Type', 'Authorization'],
+        }
+    },
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -32,8 +56,9 @@ if not UPLOAD_DIR.is_absolute():
 UPLOAD_DIR = UPLOAD_DIR.resolve()
 UPLOAD_DIR.mkdir(exist_ok=True)
 MAX_UPLOAD_SIZE_BYTES = 16 * 1024 * 1024
-AI_IMAGE_MODEL = 'gemini-3.1-flash-image'
-AI_IMAGE_CACHE_LOCK = threading.Lock()
+FOOD_IMAGE_CACHE = {}
+FOOD_IMAGE_CACHE_LOCK = threading.Lock()
+FOOD_IMAGE_CACHE_TTL_SECONDS = 3600
 DATA_SAVE_LOCK = threading.Lock()
 DELIVERY_FEEDBACK_LOCK = threading.Lock()
 DELIVERY_ISSUE_LOCK = threading.Lock()
@@ -137,7 +162,196 @@ def donation_available_quantity(data, donation):
         if item.get('donation_id') == donation_id
         and item.get('status') not in {'cancelled', 'rejected'}
     )
-    return max(0, float(donation.get('quantity', 0) or 0) - requested_quantity - contributed_quantity)
+    unallocated_quantity = max(
+        0,
+        float(donation.get('quantity', 0) or 0) - requested_quantity - contributed_quantity,
+    )
+    return min(unallocated_quantity, donation_remaining_quantity(data, donation))
+
+
+def donation_distributed_quantity(data, donation):
+    donation_id = donation.get('id')
+    delivered_tasks = [
+        task for task in data.get('delivery_tasks', [])
+        if task.get('status') == 'delivered'
+        and delivery_task_donation_id(data, task) == donation_id
+    ]
+    contributions_by_id = {
+        item.get('id'): item for item in data.get('request_contributions', [])
+    }
+    requests_by_id = {
+        item.get('id'): item for item in data.get('donation_requests', [])
+    }
+    distributed = 0
+    for task in delivered_tasks:
+        task_quantity = task.get('quantity')
+        if task_quantity is None:
+            contribution = contributions_by_id.get(task.get('request_contribution_id'))
+            request_item = requests_by_id.get(task.get('request_id'))
+            task_quantity = (
+                contribution.get('quantity', 0)
+                if contribution
+                else request_item.get('requested_quantity', 0) if request_item else 0
+            )
+        distributed += float(task_quantity or 0)
+    delivered_task_ids = {task.get('id') for task in delivered_tasks}
+    delivered_contribution_ids = {
+        task.get('request_contribution_id')
+        for task in delivered_tasks
+        if task.get('request_contribution_id')
+    }
+    distributed += sum(
+        float(contribution.get('quantity', 0) or 0)
+        for contribution in data.get('request_contributions', [])
+        if contribution.get('donation_id') == donation_id
+        and contribution.get('status') == 'delivered'
+        and contribution.get('delivery_task_id') not in delivered_task_ids
+        and contribution.get('id') not in delivered_contribution_ids
+    )
+
+    task_request_ids = {task.get('request_id') for task in delivered_tasks}
+    for request_item in data.get('donation_requests', []):
+        if (
+            request_item.get('donation_id') == donation_id
+            and not request_item.get('multi_contribution')
+            and request_item.get('status') in {'completed', 'fulfilled'}
+            and request_item.get('id') not in task_request_ids
+            and not any(
+                task.get('request_id') == request_item.get('id')
+                for task in data.get('delivery_tasks', [])
+            )
+        ):
+            distributed += float(request_item.get('requested_quantity', 0) or 0)
+    return min(float(donation.get('quantity', 0) or 0), distributed)
+
+
+def donation_remaining_quantity(data, donation):
+    return max(
+        0,
+        float(donation.get('quantity', 0) or 0) - donation_distributed_quantity(data, donation),
+    )
+
+
+def donation_expiry_datetime(donation):
+    return donation_datetime(donation.get('available_until'))
+
+
+def donation_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def donation_is_within_validity_period(donation, now=None):
+    start = donation_datetime(donation.get('preparation_time'))
+    end = donation_expiry_datetime(donation)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    return start is not None and end is not None and start <= current_time < end
+
+
+def donation_is_expired(donation, now=None):
+    expiry = donation_expiry_datetime(donation)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    return expiry is not None and expiry <= current_time
+
+
+def expire_donation_if_due(data, donation, now=None):
+    if donation.get('status') in {'completed', 'cancelled', 'rejected', 'expired'}:
+        return False
+    if donation_remaining_quantity(data, donation) <= 0:
+        set_donation_status(
+            data,
+            donation,
+            'completed',
+            'system',
+            'Donation quantity fully distributed',
+        )
+        return True
+    if not donation_is_expired(donation, now):
+        return False
+    set_donation_status(
+        data,
+        donation,
+        'expired',
+        'system',
+        'Food validity period expired',
+    )
+    return True
+
+
+def expire_due_donations(data):
+    changed = False
+    for donation in data.get('donations', []):
+        changed = expire_donation_if_due(data, donation) or changed
+    return changed
+
+
+def donation_is_requestable(data, donation, now=None):
+    return (
+        donation.get('status') in {'available', 'requested', 'accepted'}
+        and donation_is_within_validity_period(donation, now)
+        and donation_available_quantity(data, donation) > 0
+    )
+
+
+def donation_can_continue_distribution(data, donation, now=None):
+    return (
+        donation.get('status') not in {'completed', 'cancelled', 'rejected', 'expired'}
+        and donation_is_within_validity_period(donation, now)
+        and donation_remaining_quantity(data, donation) > 0
+    )
+
+
+def serialize_public_donation(data, donation):
+    status_history = sorted(
+        (
+            {
+                'status': item.get('new_status', ''),
+                'created_at': item.get('created_at', ''),
+            }
+            for item in data.get('donation_status_history', [])
+            if item.get('donation_id') == donation.get('id')
+            and item.get('new_status')
+        ),
+        key=lambda item: item.get('created_at') or '',
+    )
+    return {
+        'id': donation.get('id'),
+        'food_name': donation.get('food_name', ''),
+        'category': donation.get('category', ''),
+        'description': donation.get('description', ''),
+        'quantity': donation.get('quantity', 0),
+        'available_quantity': donation_available_quantity(data, donation),
+        'distributed_quantity': donation_distributed_quantity(data, donation),
+        'remaining_quantity': donation_remaining_quantity(data, donation),
+        'quantity_unit': donation.get('quantity_unit', ''),
+        'servings': donation.get('servings', 0),
+        'is_veg': donation.get('is_veg', True),
+        'image_url': donation.get('image_url', ''),
+        'image_source': donation.get('image_source', ''),
+        'city': donation.get('city', ''),
+        'status': donation.get('status', ''),
+        'is_requestable': donation_is_requestable(data, donation),
+        'preparation_time': donation.get('preparation_time', ''),
+        'available_until': donation.get('available_until', ''),
+        'pickup_available_until': donation.get('pickup_available_until', ''),
+        'created_at': donation.get('created_at', ''),
+        'status_history': status_history,
+    }
+
+
+def public_donation_is_available(data, donation):
+    return donation_is_requestable(data, donation)
 
 
 def donation_matches_food_request(donation, request_item):
@@ -154,6 +368,8 @@ def donation_matches_food_request(donation, request_item):
 
 
 def sync_donation_request_status(data, donation, changed_by, note):
+    if donation.get('status') in {'expired', 'completed', 'cancelled', 'rejected'}:
+        return
     related_statuses = {
         item.get('status')
         for item in data.get('donation_requests', [])
@@ -232,31 +448,14 @@ def delivery_task_donation_id(data, task):
     return contribution.get('donation_id') if contribution else None
 
 
-def delivery_issue_reporter_id(issue):
-    return issue.get('reporter_id') or issue.get('user_id') or issue.get('receiver_id')
-
-
-def delivery_task_donor_id(data, task):
-    contribution = next(
-        (
-            item for item in data.get('request_contributions', [])
-            if item.get('id') == task.get('request_contribution_id')
-        ),
+def delivery_issue_context(data, issue):
+    task_id = issue.get('task_id') or issue.get('delivery_id')
+    task = next(
+        (item for item in data.get('delivery_tasks', []) if item.get('id') == task_id),
         None,
     )
-    if contribution:
-        return contribution.get('donor_id')
-    donation_id = delivery_task_donation_id(data, task)
-    donation = next(
-        (item for item in data.get('donations', []) if item.get('id') == donation_id),
-        None,
-    )
-    return donation.get('donor_id') if donation else None
-
-
-def delivery_task_request(data, task):
-    request_id = task.get('request_id')
-    if not request_id:
+    request_id = issue.get('request_id') or (task.get('request_id') if task else None)
+    if not request_id and task and task.get('request_contribution_id'):
         contribution = next(
             (
                 item for item in data.get('request_contributions', [])
@@ -265,130 +464,62 @@ def delivery_task_request(data, task):
             None,
         )
         request_id = contribution.get('request_id') if contribution else None
-    return next(
+    request_item = next(
         (item for item in data.get('donation_requests', []) if item.get('id') == request_id),
         None,
     )
+    donation_id = issue.get('donation_id')
+    if not donation_id and task:
+        donation_id = delivery_task_donation_id(data, task)
+    donation = next(
+        (item for item in data.get('donations', []) if item.get('id') == donation_id),
+        None,
+    )
+    return task, request_item, donation
 
 
-def delivery_task_owned_by_donor(data, task, donor_id):
-    return delivery_task_donor_id(data, task) == donor_id
-
-
-def donation_delivered_quantity(data, donation):
-    donation_id = donation.get('id')
-    requests_by_id = {
-        item.get('id'): item
-        for item in data.get('donation_requests', [])
-    }
-    contributions_by_id = {
-        item.get('id'): item
-        for item in data.get('request_contributions', [])
-    }
-    delivered_task_ids = set()
-    delivered_contribution_ids = set()
-    direct_quantities_by_request = {}
-    unlinked_delivered_quantity = 0.0
-
-    for task in data.get('delivery_tasks', []):
-        if task.get('status') != 'delivered' or delivery_task_donation_id(data, task) != donation_id:
-            continue
-        task_id = task.get('id')
-        if task_id and task_id in delivered_task_ids:
-            continue
-        if task_id:
-            delivered_task_ids.add(task_id)
-
-        contribution_id = task.get('request_contribution_id')
-        contribution = contributions_by_id.get(contribution_id)
-        if contribution_id:
-            if contribution_id in delivered_contribution_ids:
-                continue
-            delivered_contribution_ids.add(contribution_id)
-        request_item = requests_by_id.get(task.get('request_id'))
-        quantity = task.get('quantity')
-        if quantity is None:
-            quantity = (
-                contribution.get('quantity', 0)
-                if contribution_id and contribution
-                else 0 if contribution_id
-                else request_item.get('requested_quantity', 0) if request_item
-                else 0
-            )
-        quantity = max(0.0, float(quantity or 0))
-        if contribution_id:
-            unlinked_delivered_quantity += quantity
-        elif request_item:
-            request_id = request_item.get('id')
-            direct_quantities_by_request[request_id] = (
-                direct_quantities_by_request.get(request_id, 0.0) + quantity
-            )
-        else:
-            unlinked_delivered_quantity += quantity
-
-    direct_delivered_quantity = sum(
-        min(
-            delivered_quantity,
-            float(requests_by_id[request_id].get('requested_quantity', delivered_quantity) or 0),
+def delivery_issue_visible_to_user(user, issue, task, request_item, donation):
+    role = user.get('role')
+    user_id = user.get('id')
+    if role == 'admin':
+        return True
+    if role == 'requester':
+        reporter_id = issue.get('reporter_id') or issue.get('receiver_id')
+        request_reporter_id = (
+            request_item.get('requester_id', request_item.get('ngo_id'))
+            if request_item else None
         )
-        for request_id, delivered_quantity in direct_quantities_by_request.items()
+        return user_id in {reporter_id, request_reporter_id}
+    if role == 'ngo':
+        return bool(task and task.get('ngo_id') == user_id)
+    if role == 'donor':
+        return bool(donation and donation.get('donor_id') == user_id)
+    if role == 'volunteer':
+        return bool(task and task.get('volunteer_id') == user_id)
+    return False
+
+
+def serialize_delivery_issue(data, issue):
+    serialized = dict(issue)
+    task, request_item, donation = delivery_issue_context(data, issue)
+    serialized.setdefault('task_id', task.get('id') if task else issue.get('delivery_id'))
+    serialized.setdefault('delivery_id', serialized.get('task_id'))
+    serialized.setdefault('request_id', request_item.get('id') if request_item else None)
+    serialized.setdefault(
+        'donation_id',
+        donation.get('id') if donation else None,
     )
-    return direct_delivered_quantity + unlinked_delivered_quantity
-
-
-def donation_delivery_complete(data, donation):
-    quantity = float(donation.get('quantity', 0) or 0)
-    if quantity <= 0 or donation_delivered_quantity(data, donation) < quantity:
-        return False
-
-    donation_id = donation.get('id')
-    has_open_direct_request = any(
-        item.get('donation_id') == donation_id
-        and not item.get('multi_contribution')
-        and item.get('status') in {'pending', 'approved', 'accepted', 'partially_fulfilled'}
-        for item in data.get('donation_requests', [])
+    serialized.setdefault(
+        'reporter_id',
+        issue.get('receiver_id') or (
+            request_item.get('requester_id', request_item.get('ngo_id'))
+            if request_item else None
+        ),
     )
-    has_undelivered_contribution = any(
-        item.get('donation_id') == donation_id
-        and item.get('status') not in {'delivered', 'cancelled', 'rejected'}
-        for item in data.get('request_contributions', [])
-    )
-    return not has_open_direct_request and not has_undelivered_contribution
-
-
-def donation_status_for_remaining_food(data, donation):
-    donation_id = donation.get('id')
-    if any(
-        item.get('donation_id') == donation_id
-        and item.get('status') not in {'delivered', 'cancelled', 'rejected'}
-        for item in data.get('request_contributions', [])
-    ) or any(
-        item.get('donation_id') == donation_id
-        and not item.get('multi_contribution')
-        and item.get('status') in {'approved', 'accepted', 'partially_fulfilled'}
-        for item in data.get('donation_requests', [])
-    ):
-        return 'accepted'
-    if any(
-        item.get('donation_id') == donation_id
-        and not item.get('multi_contribution')
-        and item.get('status') == 'pending'
-        for item in data.get('donation_requests', [])
-    ):
-        return 'requested'
-    return 'available'
-
-
-def sync_donation_delivery_status(data, donation, changed_by):
-    if not donation or donation.get('status') in {'cancelled', 'expired', 'rejected'}:
-        return
-    if donation_delivery_complete(data, donation):
-        next_status = 'completed'
-        note = 'All donation quantity was verified as delivered'
-    else:
-        next_status = donation_status_for_remaining_food(data, donation)
-        note = 'Donation status recalculated from delivered quantities and active allocations'
-    set_donation_status(data, donation, next_status, changed_by, note)
+    serialized.setdefault('category', 'delivery')
+    serialized.setdefault('resolution_note', '')
+    serialized.setdefault('status_history', [])
+    return serialized
 
 
 def request_delivered_quantity(data, request_item):
@@ -407,15 +538,12 @@ def request_delivered_quantity(data, request_item):
         and task.get('status') == 'delivered'
     ]
     if delivered_tasks:
-        delivered_quantity = sum(
-            float(
-                task.get('quantity')
-                if task.get('quantity') is not None
-                else request_item.get('requested_quantity', 0)
-            ) or 0
+        return sum(
+            float(task.get('quantity', requested_quantity) or 0)
             for task in delivered_tasks
         )
-        return min(requested_quantity, max(0.0, delivered_quantity))
+    if request_item.get('status') in {'completed', 'fulfilled'}:
+        return requested_quantity
     return 0
 
 
@@ -439,7 +567,7 @@ def request_has_pending_delivery(data, request_item):
 
 def request_has_available_food(data, request_item):
     return any(
-        donation.get('status') in {'available', 'requested', 'accepted'}
+        donation_is_requestable(data, donation)
         and donation_matches_food_request(donation, request_item)
         and (
             donation_available_quantity(data, donation) > 0
@@ -500,14 +628,12 @@ def donor_completed_donations(data, donor_id):
     if not donor_id:
         return []
 
-    completed_donations = [
+    donor_donations = [
         item
         for item in data.get('donations', [])
         if item.get('donor_id') == donor_id
-        and item.get('status') == 'completed'
-        and donation_delivery_complete(data, item)
     ]
-    donations_by_id = {item.get('id'): item for item in completed_donations}
+    donations_by_id = {item.get('id'): item for item in donor_donations}
 
     def delivery_date(task):
         return next(
@@ -530,9 +656,16 @@ def donor_completed_donations(data, donor_id):
 
     delivered_tasks_by_donation = {}
     for task in data.get('delivery_tasks', []):
-        donation_id = task.get('donation_id')
+        donation_id = delivery_task_donation_id(data, task)
         if task.get('status') == 'delivered' and donation_id in donations_by_id:
             delivered_tasks_by_donation.setdefault(donation_id, []).append(task)
+
+    completed_donations = [
+        donation
+        for donation in donor_donations
+        if donation.get('status') == 'completed'
+        or donation.get('id') in delivered_tasks_by_donation
+    ]
 
     completed = []
     for donation in completed_donations:
@@ -551,10 +684,49 @@ def donor_completed_donations(data, donor_id):
 
 def create_donor_certificates(data, donor_id):
     completed_donations = donor_completed_donations(data, donor_id)
+    donation_certificates = []
     milestone_certificates = []
     certificates_changed = False
     certificates = data.setdefault('donation_certificates', [])
     donor = find_profile_by_id(data, donor_id) or {}
+
+    for completed_count, completed_item in enumerate(completed_donations, start=1):
+        donation = completed_item['donation']
+        existing_certificate = next(
+            (
+                item for item in certificates
+                if item.get('donor_id') == donor_id
+                and item.get('donation_id') == donation.get('id')
+                and (item.get('certificate_type') == 'donation' or not item.get('milestone'))
+            ),
+            None,
+        )
+        if existing_certificate:
+            if 'completed_donations' not in existing_certificate:
+                existing_certificate['completed_donations'] = completed_count
+                certificates_changed = True
+            continue
+        certificate = {
+            'id': f'certificate-{uuid.uuid4().hex}',
+            'certificate_id': f'SFDRS-DON-{uuid.uuid4().hex.upper()}',
+            'certificate_type': 'donation',
+            'donor_id': donor_id,
+            'donor_name': donor.get('full_name', ''),
+            'donation_id': donation.get('id'),
+            'food_name': donation.get('food_name', ''),
+            'category': donation.get('category', ''),
+            'quantity': donation.get('quantity', 0),
+            'quantity_unit': donation.get('quantity_unit', ''),
+            'completed_donations': completed_count,
+            'donation_date': donation.get('created_at', ''),
+            'delivery_date': completed_item['delivery_date'],
+            'title': 'Certificate of Food Donation',
+            'message': 'Your generous food donation helped reduce food waste and bring nourishment to people in need.',
+            'created_at': utc_now(),
+        }
+        certificates.append(certificate)
+        donation_certificates.append(certificate)
+        certificates_changed = True
 
     for target, milestone in DONATION_MILESTONES.items():
         if len(completed_donations) < target:
@@ -603,7 +775,7 @@ def create_donor_certificates(data, donor_id):
             milestone_certificates.append(certificate)
             certificates_changed = True
     return {
-        'donation_certificates': [],
+        'donation_certificates': donation_certificates,
         'milestone_certificates': milestone_certificates,
         'changed': certificates_changed,
     }
@@ -639,7 +811,132 @@ def seed_data():
         'volunteer_availability': [],
         'delivery_feedback': [],
         'delivery_issues': [],
+        'donation_cancellations': [],
     })
+
+
+def task_deadline_datetime(value, date_only_is_end_of_day=False):
+    if not value:
+        return None
+    try:
+        value_string = str(value).strip()
+        if date_only_is_end_of_day and len(value_string) == 10:
+            parsed = datetime.combine(
+                datetime.fromisoformat(value_string).date(),
+                datetime.max.time(),
+            )
+        else:
+            parsed = datetime.fromisoformat(value_string.replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return parsed.astimezone() if parsed.tzinfo is None else parsed
+
+
+def delivery_task_deadline(data, task):
+    deadlines = [
+        task_deadline_datetime(task.get(field), date_only_is_end_of_day=True)
+        for field in ('deadline', 'scheduled_at', 'available_until', 'pickup_available_until')
+    ]
+    for date_field, time_field in (
+        ('scheduled_date', 'scheduled_time'),
+        ('required_date', 'required_time'),
+        ('due_date', 'due_time'),
+    ):
+        date_value = task.get(date_field)
+        time_value = task.get(time_field)
+        if date_value:
+            scheduled_value = f'{date_value}T{time_value}' if time_value else date_value
+            deadlines.append(
+                task_deadline_datetime(scheduled_value, date_only_is_end_of_day=True)
+            )
+
+    request_item = next(
+        (item for item in data.get('donation_requests', []) if item.get('id') == task.get('request_id')),
+        None,
+    )
+    request_contribution = next(
+        (
+            item for item in data.get('request_contributions', [])
+            if item.get('id') == task.get('request_contribution_id')
+        ),
+        None,
+    )
+    if not request_item and request_contribution:
+        request_item = next(
+            (
+                item for item in data.get('donation_requests', [])
+                if item.get('id') == request_contribution.get('request_id')
+            ),
+            None,
+        )
+    if request_item:
+        required_date = request_item.get('required_date')
+        required_time = request_item.get('required_time')
+        scheduled_value = (
+            f'{required_date}T{required_time}'
+            if required_date and required_time
+            else required_date
+        )
+        deadlines.append(task_deadline_datetime(scheduled_value, date_only_is_end_of_day=True))
+
+    donation_id = delivery_task_donation_id(data, task)
+    if not donation_id and request_contribution:
+        donation_id = request_contribution.get('donation_id')
+    donation = next(
+        (item for item in data.get('donations', []) if item.get('id') == donation_id),
+        None,
+    )
+    if donation:
+        deadlines.extend(
+            task_deadline_datetime(donation.get(field))
+            for field in ('available_until', 'pickup_available_until')
+        )
+
+    community_contribution = next(
+        (
+            item for item in data.get('community_need_contributions', [])
+            if item.get('id') == task.get('community_contribution_id')
+        ),
+        None,
+    )
+    need_id = task.get('community_need_id') or (
+        community_contribution.get('need_id') if community_contribution else None
+    )
+    need = next(
+        (item for item in data.get('community_needs', []) if item.get('id') == need_id),
+        None,
+    )
+    if need:
+        deadlines.append(
+            task_deadline_datetime(need.get('required_date'), date_only_is_end_of_day=True)
+        )
+
+    valid_deadlines = [deadline for deadline in deadlines if deadline is not None]
+    return min(valid_deadlines) if valid_deadlines else None
+
+
+def remove_expired_incomplete_delivery_tasks(data, now=None):
+    current_time = now or datetime.now().astimezone()
+    if current_time.tzinfo is None:
+        current_time = current_time.astimezone()
+    kept_tasks = []
+    removed_ids = []
+    for task in data.get('delivery_tasks', []):
+        if task.get('status') in {'completed', 'delivered'}:
+            kept_tasks.append(task)
+            continue
+        deadline = delivery_task_deadline(data, task)
+        if deadline is not None and deadline <= current_time:
+            removed_ids.append(task.get('id', '<missing id>'))
+        else:
+            kept_tasks.append(task)
+    if removed_ids:
+        data['delivery_tasks'] = kept_tasks
+        app.logger.info(
+            'Removed incomplete delivery tasks past their linked deadline: %s',
+            ', '.join(removed_ids),
+        )
+    return bool(removed_ids)
 
 
 def load_data():
@@ -667,12 +964,17 @@ def load_data():
             if newer.get(key) in (None, '') and value not in (None, ''):
                 newer[key] = value
 
+    data_changed = False
     if duplicate_ids:
         app.logger.warning(
             'Removed duplicate donation rows for existing IDs: %s',
             ', '.join(sorted(duplicate_ids)),
         )
         data['donations'] = list(unique_donations.values())
+        data_changed = True
+    if remove_expired_incomplete_delivery_tasks(data):
+        data_changed = True
+    if data_changed:
         save_data(data)
     return data
 
@@ -722,16 +1024,6 @@ def find_profile_by_id(data, profile_id):
         if profile.get('id') == profile_id:
             return profile
     return None
-
-
-def local_demo_mode_enabled():
-    environments = {
-        os.getenv(name, '').strip().lower()
-        for name in ('APP_ENV', 'FLASK_ENV')
-    }
-    if environments.intersection({'production', 'prod'}):
-        return False
-    return app.debug or bool(environments.intersection({'development', 'dev'}))
 
 
 def current_user_from_auth():
@@ -823,48 +1115,12 @@ def login_user():
         if requested_role not in ROLE_VALUES:
             return jsonify({'error': 'Select a valid account role.'}), 400
 
-    if not email or not isinstance(password, str) or not password.strip():
-        return jsonify({'error': 'Email and password are required.'}), 400
+    if not isinstance(password, str) or not password.strip():
+        return jsonify({'error': 'Password is required.'}), 400
+    if not email:
+        return jsonify({'error': 'Email is required.'}), 400
 
     data = load_data()
-    if local_demo_mode_enabled():
-        role = requested_role or 'donor'
-        if role == 'admin':
-            return jsonify({'error': 'Invalid email or password.'}), 401
-
-        profile = find_profile_by_email(data, email, role)
-        if not profile:
-            source_profile = find_profile_by_email(data, email)
-            if source_profile:
-                profile = create_role_profile(data, source_profile, role)
-            else:
-                profile = {
-                    'id': f'user-{uuid.uuid4().hex[:8]}',
-                    'full_name': email.split('@', 1)[0] or email,
-                    'email': email,
-                    'phone': '',
-                    'role': role,
-                    'organization_name': '',
-                    'address': '',
-                    'city': '',
-                    'profile_image': '',
-                    'created_at': utc_now(),
-                }
-                data['profiles'].append(profile)
-
-        token = uuid.uuid4().hex
-        data['sessions'] = [
-            session for session in data.get('sessions', [])
-            if session.get('user_id') != profile['id']
-        ]
-        data['sessions'].append({
-            'token': token,
-            'user_id': profile['id'],
-            'created_at': utc_now(),
-        })
-        save_data(data)
-        return jsonify({'token': token, 'user': serialize_profile(profile)}), 200
-
     profile = find_profile_by_email(data, email, requested_role) if requested_role else find_profile_by_email(data, email)
     email_profile = find_profile_by_email(data, email)
     if not email_profile:
@@ -958,12 +1214,16 @@ def dashboard_overview():
         donor_requests = [r for r in donation_requests if any(d['id'] == r['donation_id'] and d['donor_id'] == user['id'] for d in donor_donations)]
         stats = {
             'total_donations': len(donor_donations),
-            'completed_donations': len(donor_completed_donations(data, user['id'])),
+            'completed_donations': sum(1 for d in donor_donations if d['status'] == 'completed'),
             'pending_requests': sum(1 for r in donor_requests if r['status'] == 'pending'),
             'estimated_meals': sum(int(d.get('servings', 0) or 0) for d in donor_donations if d['status'] in {'available', 'requested', 'accepted', 'completed'}),
             'notifications': len(notifications),
         }
-        return jsonify({'stats': stats, 'recent_activity': donor_donations[:3]})
+        recent_activity = [
+            donation for donation in donor_donations
+            if not donation_is_expired(donation)
+        ][:3]
+        return jsonify({'stats': stats, 'recent_activity': recent_activity})
 
     if user['role'] == 'requester':
         own_requests = [
@@ -996,7 +1256,7 @@ def dashboard_overview():
             f'{quantity:g} {unit}' for unit, quantity in sorted(values.items()) if quantity
         ) or '0'
         stats = {
-            'available_donations': len([d for d in donations if d['status'] in {'available', 'requested', 'accepted'}]),
+            'available_donations': sum(1 for donation in donations if donation_is_requestable(data, donation)),
             'submitted_requests': len(own_requests),
             'approved_requests': sum(1 for r in own_requests if r['status'] == 'approved'),
             'completed_distributions': sum(1 for r in own_requests if r['status'] == 'completed'),
@@ -1030,7 +1290,7 @@ def dashboard_overview():
         ]
         tasks = [task for task in data.get('delivery_tasks', []) if task.get('ngo_id') == user['id']]
         stats = {
-            'available_donations': len([d for d in donations if d['status'] in {'available', 'requested', 'accepted'}]),
+            'available_donations': sum(1 for donation in donations if donation_is_requestable(data, donation)),
             'incoming_requests': len(incoming_requests),
             'pending_requests': sum(1 for r in incoming_requests if r.get('status') == 'pending'),
             'active_deliveries': sum(1 for task in tasks if task.get('status') != 'delivered'),
@@ -1049,37 +1309,351 @@ def dashboard_overview():
     }, 'recent_activity': data.get('audit_logs', [])[-3:]})
 
 
+@app.route('/api/dashboard/public-overview', methods=['GET'])
+def public_dashboard_overview():
+    data = load_data()
+    now = datetime.now(timezone.utc)
+
+    donations = [
+        donation for donation in data.get('donations', [])
+        if donation.get('status') not in {'cancelled', 'rejected'}
+    ]
+    meals_redistributed = sum(
+        float(donation.get('servings', 0) or 0)
+        * donation_distributed_quantity(data, donation)
+        / float(donation.get('quantity', 0) or 1)
+        for donation in donations
+        if float(donation.get('quantity', 0) or 0) > 0
+    )
+    organizations_by_name = {}
+    for profile in data.get('profiles', []):
+        name = str(profile.get('organization_name') or '').strip()
+        if profile.get('role') != 'ngo' or not name:
+            continue
+        organization_key = name.casefold()
+        organizations_by_name.setdefault(organization_key, {
+            'organization_name': name,
+            'city': str(profile.get('city') or '').strip(),
+        })
+    organizations = sorted(
+        organizations_by_name.values(),
+        key=lambda organization: organization['organization_name'].casefold(),
+    )
+    organizations_by_id = {
+        profile.get('id'): profile
+        for profile in data.get('profiles', [])
+        if profile.get('role') == 'ngo'
+    }
+    fulfilled_requests = sum(
+        1 for request_item in data.get('donation_requests', [])
+        if request_item.get('status') in {'completed', 'fulfilled'}
+    )
+    completed_donations = [
+        donation for donation in donations
+        if donation.get('status') == 'completed'
+    ]
+    active_donations = [
+        donation for donation in donations
+        if donation_is_requestable(data, donation)
+    ]
+
+    distributed_before_expiry = 0.0
+    for donation in donations:
+        expiry = donation_expiry_datetime(donation)
+        if not expiry:
+            continue
+        donation_quantity_before_expiry = 0.0
+        donation_id = donation.get('id')
+        tasks = [
+            task for task in data.get('delivery_tasks', [])
+            if task.get('status') == 'delivered'
+            and delivery_task_donation_id(data, task) == donation_id
+        ]
+        contributions_by_id = {
+            item.get('id'): item for item in data.get('request_contributions', [])
+        }
+        requests_by_id = {
+            item.get('id'): item for item in data.get('donation_requests', [])
+        }
+        delivered_task_ids = {task.get('id') for task in tasks}
+        delivered_contribution_ids = {
+            task.get('request_contribution_id')
+            for task in tasks
+            if task.get('request_contribution_id')
+        }
+        for task in tasks:
+            delivered_at = next(
+                (
+                    item.get('created_at')
+                    for item in task.get('status_history', [])
+                    if item.get('status') == 'delivered'
+                ),
+                task.get('delivered_at') or task.get('updated_at'),
+            )
+            delivered_time = donation_datetime(delivered_at)
+            if not delivered_time or delivered_time >= expiry:
+                continue
+            contribution = contributions_by_id.get(task.get('request_contribution_id'))
+            request_item = requests_by_id.get(task.get('request_id'))
+            quantity = task.get('quantity')
+            if quantity is None:
+                quantity = (
+                    contribution.get('quantity', 0)
+                    if contribution
+                    else request_item.get('requested_quantity', 0) if request_item else 0
+                )
+            donation_quantity_before_expiry += float(quantity or 0)
+        for contribution in data.get('request_contributions', []):
+            if (
+                contribution.get('donation_id') != donation_id
+                or contribution.get('status') != 'delivered'
+                or contribution.get('delivery_task_id') in delivered_task_ids
+                or contribution.get('id') in delivered_contribution_ids
+            ):
+                continue
+            delivered_time = donation_datetime(contribution.get('delivered_at'))
+            if delivered_time and delivered_time < expiry:
+                donation_quantity_before_expiry += float(contribution.get('quantity', 0) or 0)
+        donation_quantity = float(donation.get('quantity', 0) or 0)
+        donation_servings = float(donation.get('servings', 0) or 0)
+        if donation_quantity > 0 and donation_servings > 0:
+            distributed_before_expiry += donation_servings * min(
+                donation_quantity_before_expiry,
+                donation_distributed_quantity(data, donation),
+            ) / donation_quantity
+
+    community_needs = []
+    needs_by_id = {}
+    need_contributions = data.get('community_need_contributions', [])
+    tasks_by_contribution = {
+        task.get('community_contribution_id'): task
+        for task in data.get('delivery_tasks', [])
+        if task.get('community_contribution_id')
+    }
+    for need in data.get('community_needs', []):
+        required_quantity = float(need.get('required_quantity', 0) or 0)
+        delivered_quantity = sum(
+            float(item.get('quantity', 0) or 0)
+            for item in need_contributions
+            if item.get('need_id') == need.get('id')
+            and (
+                item.get('status') == 'delivered'
+                or (tasks_by_contribution.get(item.get('id')) or {}).get('status') == 'delivered'
+            )
+        )
+        status = need.get('status', 'open')
+        if required_quantity > 0 and delivered_quantity >= required_quantity:
+            status = 'fulfilled'
+        elif status == 'fulfilled':
+            status = 'pending_delivery' if any(
+                item.get('need_id') == need.get('id') for item in need_contributions
+            ) else 'open'
+        if status not in {'open', 'partial', 'pending_delivery'}:
+            continue
+        organization = organizations_by_id.get(need.get('ngo_id'), {})
+        public_need = {
+            'id': need.get('id'),
+            'category': need.get('category', ''),
+            'required_quantity': required_quantity,
+            'delivered_quantity': delivered_quantity,
+            'remaining_quantity': max(0, required_quantity - delivered_quantity),
+            'servings': need.get('servings', 0),
+            'location': need.get('location', ''),
+            'city': need.get('city', ''),
+            'urgency': need.get('urgency', ''),
+            'required_date': need.get('required_date', ''),
+            'description': need.get('description', ''),
+            'status': status,
+            'organization_name': organization.get('organization_name', ''),
+            'created_at': need.get('created_at', ''),
+        }
+        community_needs.append(public_need)
+        needs_by_id[need.get('id')] = public_need
+
+    matches = []
+    for donation in active_donations:
+        donation_quantity = float(donation.get('quantity', 0) or 0)
+        donation_available = float(donation_available_quantity(data, donation) or 0)
+        donation_servings = float(donation.get('servings', 0) or 0)
+        if donation_quantity <= 0 or donation_available <= 0 or donation_servings <= 0:
+            continue
+        available_servings = donation_servings * donation_available / donation_quantity
+        donation_category = str(donation.get('category') or '').strip().casefold()
+        donation_city = str(donation.get('city') or '').strip().casefold()
+        if not donation_category or not donation_city:
+            continue
+        for need in community_needs:
+            need_category = str(need.get('category') or '').strip().casefold()
+            need_city = str(need.get('city') or '').strip().casefold()
+            remaining_need = float(need.get('remaining_quantity', 0) or 0)
+            if (
+                donation_category != need_category
+                or not need_city
+                or donation_city != need_city
+                or remaining_need <= 0
+                or available_servings < remaining_need
+            ):
+                continue
+            matches.append({
+                'donation_id': donation.get('id'),
+                'food_name': donation.get('food_name', ''),
+                'category': donation.get('category', ''),
+                'city': donation.get('city', ''),
+                'available_quantity': donation_available,
+                'quantity_unit': donation.get('quantity_unit', ''),
+                'need_id': need.get('id'),
+                'need_remaining_quantity': remaining_need,
+                'organization_name': need.get('organization_name', ''),
+            })
+
+    opportunities = []
+    for task in data.get('delivery_tasks', []):
+        if task.get('status') != 'open':
+            continue
+        donation_id = delivery_task_donation_id(data, task)
+        donation = next(
+            (item for item in data.get('donations', []) if item.get('id') == donation_id),
+            None,
+        )
+        need = needs_by_id.get(task.get('community_need_id'))
+        if donation_id and (
+            not donation or not donation_can_continue_distribution(data, donation)
+        ):
+            continue
+        food_category = (
+            donation.get('category', '') if donation
+            else need.get('category', '') if need
+            else ''
+        )
+        city = donation.get('city', '') if donation else need.get('city', '') if need else ''
+        opportunities.append({
+            'category': food_category,
+            'city': city,
+            'created_at': task.get('created_at', ''),
+        })
+
+    public_alerts = []
+    for need in community_needs:
+        if str(need.get('urgency') or '').casefold() in {'urgent', 'high', 'critical'}:
+            public_alerts.append({
+                'type': 'urgent_need',
+                'message': f"Urgent community need: {need.get('category') or 'food'} in {need.get('city') or 'an unspecified location'}.",
+                'created_at': need.get('created_at', ''),
+            })
+    for donation in active_donations:
+        expiry = donation_expiry_datetime(donation)
+        if not expiry:
+            continue
+        hours_left = (expiry - now).total_seconds() / 3600
+        if 0 < hours_left <= 24:
+            public_alerts.append({
+                'type': 'expiring_food',
+                'message': f"{donation.get('food_name') or 'A food listing'} in {donation.get('city') or 'an unspecified location'} expires within 24 hours.",
+                'created_at': donation.get('available_until', ''),
+            })
+    public_alerts.sort(
+        key=lambda item: item.get('created_at') or '',
+        reverse=True,
+    )
+    volunteer_groups = {}
+    for profile in data.get('profiles', []):
+        volunteer_id = profile.get('id')
+        if (
+            profile.get('role') != 'volunteer'
+            or not volunteer_id
+            or str(profile.get('status') or '').strip().casefold()
+            in {'inactive', 'disabled', 'deactivated', 'deleted', 'suspended'}
+        ):
+            continue
+
+        phone_digits = re.sub(r'\D', '', str(profile.get('phone') or ''))
+        if len(phone_digits) == 12 and phone_digits.startswith('91'):
+            phone_digits = phone_digits[2:]
+        elif len(phone_digits) == 11 and phone_digits.startswith('0'):
+            phone_digits = phone_digits[1:]
+        identity_key = f'phone:{phone_digits}' if phone_digits else f'id:{volunteer_id}'
+        existing = volunteer_groups.get(identity_key)
+        if not existing or str(profile.get('created_at') or '') > str(existing.get('created_at') or ''):
+            volunteer_groups[identity_key] = profile
+
+    volunteers = [
+        {
+            'id': profile['id'],
+            'full_name': profile.get('full_name', ''),
+            'city': profile.get('city', ''),
+            'status': profile.get('status') or 'Registered',
+        }
+        for profile in volunteer_groups.values()
+    ]
+
+    return jsonify({
+        'stats': {
+            'total_donations': len(donations),
+            'available_donations': len(active_donations),
+            'meals_redistributed': round(meals_redistributed),
+            'fulfilled_requests': fulfilled_requests,
+            'connected_organizations': len(organizations),
+            'completed_donations': len(completed_donations),
+            'active_donations': len(active_donations),
+            'meals_redistributed_before_expiry': round(distributed_before_expiry),
+            'open_volunteer_opportunities': len(opportunities),
+        },
+        'organizations': organizations,
+        'community_needs': community_needs,
+        'matches': matches,
+        'volunteers': volunteers,
+        'volunteer_opportunities': opportunities,
+        'alerts': public_alerts[:10],
+    })
+
+
 @app.route('/api/donations', methods=['GET'])
 def list_donations():
     user = current_user_from_auth()
-    if not user:
-        return jsonify({'error': 'Authentication required'}), 401
     data = load_data()
+    public_scope = request.args.get('scope')
+    if public_scope == 'public_dashboard':
+        public_donations = [
+            serialize_public_donation(data, donation)
+            for donation in data.get('donations', [])
+            if donation.get('status') not in {'cancelled', 'rejected'}
+            and not donation_is_expired(donation)
+        ]
+        return jsonify({'donations': public_donations})
+    if public_scope == 'public_available':
+        public_donations = [
+            serialize_public_donation(data, donation)
+            for donation in data.get('donations', [])
+            if public_donation_is_available(data, donation)
+        ]
+        return jsonify({'donations': public_donations})
+    if not user:
+        public_donations = [
+            serialize_public_donation(data, donation)
+            for donation in data.get('donations', [])
+            if public_donation_is_available(data, donation)
+        ]
+        return jsonify({'donations': public_donations})
     if user['role'] == 'donor':
-        donations = [d for d in data.get('donations', []) if d['donor_id'] == user['id']]
-        corrected_completion_status = False
-        for donation in donations:
-            if donation.get('status') == 'completed' and not donation_delivery_complete(data, donation):
-                set_donation_status(
-                    data,
-                    donation,
-                    donation_status_for_remaining_food(data, donation),
-                    'system',
-                    'Completion corrected because delivered quantities do not cover the donation quantity',
-                )
-                corrected_completion_status = True
-        if corrected_completion_status:
-            save_data(data)
+        donations = [
+            donation for donation in data.get('donations', [])
+            if donation['donor_id'] == user['id']
+            and not donation_is_expired(donation)
+        ]
     elif user['role'] in {'requester', 'ngo'}:
-        donations = [d for d in data.get('donations', []) if d.get('status') in {'available', 'requested', 'accepted'}]
+        donations = [
+            serialize_public_donation(data, donation)
+            for donation in data.get('donations', [])
+            if donation_is_requestable(data, donation)
+        ]
     elif user['role'] == 'volunteer':
         donations = []
     else:
-        donations = data.get('donations', [])
-    if user.get('role') == 'requester':
-        for donation in donations:
-            donation['available_quantity'] = donation_available_quantity(data, donation)
-    elif user.get('role') == 'donor':
+        donations = [
+            donation for donation in data.get('donations', [])
+            if not donation_is_expired(donation)
+        ]
+    if user.get('role') == 'donor':
         donations_by_id = {item.get('id'): item for item in donations}
         tasks_by_id = {item.get('id'): item for item in data.get('delivery_tasks', [])}
         feedback_by_donation = {}
@@ -1108,43 +1682,70 @@ def list_donations():
         for donation in donations:
             donor = profiles.get(donation.get('donor_id'), {})
             donation['donor_organization'] = donor.get('organization_name') or donor.get('full_name', '')
+    for donation in donations:
+        donation['available_quantity'] = donation_available_quantity(data, donation)
+        donation['distributed_quantity'] = donation_distributed_quantity(data, donation)
+        donation['remaining_quantity'] = donation_remaining_quantity(data, donation)
     return jsonify({'donations': donations})
 
 
 @app.route('/api/donations', methods=['POST'])
 def create_donation():
     user = current_user_from_auth()
-    if not user or user['role'] not in {'donor', 'admin'}:
+    if not user:
+        return jsonify({'error': 'Authentication required to create a donation.'}), 401
+    if user['role'] not in {'donor', 'admin'}:
         return jsonify({'error': 'Only donors can create donations.'}), 403
 
     payload = request.get_json(silent=True) or {}
     required = [
         'food_name', 'category', 'quantity', 'quantity_unit', 'preparation_time',
-        'available_until', 'pickup_available_until', 'pickup_location', 'city',
+        'available_until', 'pickup_location', 'city',
     ]
     missing = [field for field in required if not payload.get(field)]
     if missing:
         field_labels = {
             'available_until': 'Food Expiry Date & Time',
-            'pickup_available_until': 'Pickup Available Until',
         }
         missing_labels = [field_labels.get(field, field.replace('_', ' ').capitalize()) for field in missing]
         return jsonify({'error': f'Missing required fields: {", ".join(missing_labels)}'}), 400
+    food_name = str(payload.get('food_name') or '').strip()
+    if not food_name:
+        return jsonify({'error': 'Food name is required.'}), 400
+    image_url = str(payload.get('image_url') or '').strip()
 
     expiry_error = validate_food_expiry(payload['preparation_time'], payload['available_until'])
     if expiry_error:
         return jsonify({'error': expiry_error}), 400
+    if donation_is_expired({'available_until': payload['available_until']}):
+        return jsonify({'error': 'Food Expiry Date & Time must be in the future.'}), 400
+    pickup_deadline = payload.get('pickup_available_until') or payload['available_until']
     pickup_error = validate_pickup_deadline(
         payload['preparation_time'],
         payload['available_until'],
-        payload['pickup_available_until'],
+        pickup_deadline,
     )
     if pickup_error:
         return jsonify({'error': pickup_error}), 400
 
-    quantity = float(payload['quantity'])
-    if quantity <= 0:
+    try:
+        quantity = float(payload['quantity'])
+        servings = int(payload.get('servings', quantity))
+    except (TypeError, ValueError, OverflowError):
+        return jsonify({'error': 'Quantity and estimated servings must be valid numbers.'}), 400
+    if not math.isfinite(quantity) or quantity <= 0:
         return jsonify({'error': 'Quantity must be greater than zero.'}), 400
+    if servings <= 0:
+        return jsonify({'error': 'Estimated servings must be greater than zero.'}), 400
+
+    preparation_time = donation_datetime(payload['preparation_time'])
+    available_until = donation_datetime(payload['available_until'])
+    pickup_available_until = donation_datetime(pickup_deadline)
+    if not preparation_time or not available_until or not pickup_available_until:
+        return jsonify({'error': 'Preparation, expiry, and pickup times must be valid date-time values.'}), 400
+    preparation_time = preparation_time.astimezone(timezone.utc).isoformat()
+    available_until = available_until.astimezone(timezone.utc).isoformat()
+    pickup_available_until = pickup_available_until.astimezone(timezone.utc).isoformat()
 
     data = load_data()
     submission_key = request.headers.get('Idempotency-Key', '').strip()
@@ -1162,18 +1763,18 @@ def create_donation():
     donation = {
         'id': f'donation-{uuid.uuid4().hex}',
         'donor_id': user['id'],
-        'food_name': str(payload['food_name']).strip(),
+        'food_name': food_name,
         'category': str(payload['category']).strip(),
         'description': payload.get('description', ''),
         'quantity': quantity,
         'quantity_unit': str(payload['quantity_unit']).strip(),
-        'servings': int(payload.get('servings', quantity)),
+        'servings': servings,
         'is_veg': bool(payload.get('is_veg', True)),
-        'image_url': payload.get('image_url', ''),
+        'image_url': image_url,
         'image_source': payload.get('image_source', ''),
-        'preparation_time': payload['preparation_time'],
-        'available_until': payload['available_until'],
-        'pickup_available_until': payload['pickup_available_until'],
+        'preparation_time': preparation_time,
+        'available_until': available_until,
+        'pickup_available_until': pickup_available_until,
         'pickup_location': str(payload['pickup_location']).strip(),
         'city': str(payload['city']).strip(),
         'latitude': payload.get('latitude'),
@@ -1206,21 +1807,35 @@ def create_donation():
         'read_at': None,
         'created_at': utc_now(),
     })
-    save_data(data)
+    try:
+        save_data(data)
+    except OSError:
+        app.logger.exception('Could not persist donation %s.', donation['id'])
+        return jsonify({'error': 'The donation could not be saved. Please try again.'}), 500
     return jsonify({'donation': donation}), 201
 
 
 @app.route('/api/donations/<donation_id>', methods=['GET'])
 def get_donation(donation_id):
     user = current_user_from_auth()
-    if not user:
-        return jsonify({'error': 'Authentication required'}), 401
     data = load_data()
     donation = next((d for d in data['donations'] if d['id'] == donation_id), None)
-    if not donation:
+    if not donation or donation_is_expired(donation):
         return jsonify({'error': 'Donation not found'}), 404
-    donation['_history'] = [h for h in data['donation_status_history'] if h['donation_id'] == donation_id]
-    return jsonify({'donation': donation})
+    if user and (
+        user.get('role') == 'admin'
+        or (user.get('role') == 'donor' and donation.get('donor_id') == user.get('id'))
+    ):
+        donation['_history'] = [h for h in data['donation_status_history'] if h['donation_id'] == donation_id]
+        donation['available_quantity'] = donation_available_quantity(data, donation)
+        donation['distributed_quantity'] = donation_distributed_quantity(data, donation)
+        donation['remaining_quantity'] = donation_remaining_quantity(data, donation)
+        return jsonify({'donation': donation})
+    if donation.get('status') in {'cancelled', 'rejected'}:
+        return jsonify({'error': 'Donation not found'}), 404
+    if not user or user.get('role') in {'donor', 'requester', 'ngo', 'volunteer'}:
+        return jsonify({'donation': serialize_public_donation(data, donation)})
+    return jsonify({'error': 'Donation not found'}), 404
 
 
 @app.route('/api/donations/<donation_id>', methods=['PATCH'])
@@ -1229,6 +1844,8 @@ def update_donation(donation_id):
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
     data = load_data()
+    if expire_due_donations(data):
+        save_data(data)
     donation = next((d for d in data['donations'] if d['id'] == donation_id), None)
     if not donation:
         return jsonify({'error': 'Donation not found'}), 404
@@ -1236,74 +1853,6 @@ def update_donation(donation_id):
         return jsonify({'error': 'You can only edit your own donations.'}), 403
 
     payload = request.get_json(silent=True) or {}
-    if not isinstance(payload, dict):
-        return jsonify({'error': 'Donation changes must be sent as a JSON object.'}), 400
-
-    editable_fields = {
-        'food_name', 'category', 'description', 'quantity', 'quantity_unit',
-        'servings', 'is_veg', 'image_url', 'image_source', 'preparation_time',
-        'available_until', 'pickup_available_until', 'pickup_location', 'city',
-        'handling_instructions',
-    }
-    unsupported_fields = set(payload) - editable_fields - {'status'}
-    if unsupported_fields:
-        return jsonify({'error': 'Unsupported donation fields: ' + ', '.join(sorted(unsupported_fields))}), 400
-
-    donation_fields = editable_fields.intersection(payload)
-    if donation_fields:
-        values = {**donation, **payload}
-        required_fields = (
-            'food_name', 'category', 'quantity_unit', 'preparation_time',
-            'available_until', 'pickup_available_until', 'pickup_location', 'city',
-        )
-        for field in required_fields:
-            if not isinstance(values.get(field), str) or not values[field].strip():
-                label = field.replace('_', ' ').capitalize()
-                return jsonify({'error': f'{label} is required.'}), 400
-
-        for field in ('food_name', 'category', 'quantity_unit', 'pickup_location', 'city'):
-            payload[field] = values[field].strip()
-
-        try:
-            quantity = float(values.get('quantity'))
-        except (TypeError, ValueError):
-            return jsonify({'error': 'Quantity must be a valid number greater than zero.'}), 400
-        if not math.isfinite(quantity) or quantity <= 0:
-            return jsonify({'error': 'Quantity must be a valid number greater than zero.'}), 400
-        payload['quantity'] = quantity
-
-        try:
-            servings_value = float(values.get('servings', values.get('quantity')))
-        except (TypeError, ValueError):
-            return jsonify({'error': 'Estimated servings must be a whole number greater than zero.'}), 400
-        if not math.isfinite(servings_value) or servings_value < 1 or not servings_value.is_integer():
-            return jsonify({'error': 'Estimated servings must be a whole number greater than zero.'}), 400
-        payload['servings'] = int(servings_value)
-
-        is_veg = values.get('is_veg', donation.get('is_veg', True))
-        if isinstance(is_veg, str) and is_veg.casefold() in {'true', 'false'}:
-            is_veg = is_veg.casefold() == 'true'
-        if not isinstance(is_veg, bool):
-            return jsonify({'error': 'Food type must be selected as vegetarian or non-vegetarian.'}), 400
-        payload['is_veg'] = is_veg
-
-        for field in ('description', 'image_url', 'image_source', 'handling_instructions'):
-            value = values.get(field, '')
-            if not isinstance(value, str):
-                return jsonify({'error': f'{field.replace("_", " ").capitalize()} must be text.'}), 400
-            payload[field] = value
-
-        expiry_error = validate_food_expiry(values['preparation_time'], values['available_until'])
-        if expiry_error:
-            return jsonify({'error': expiry_error}), 400
-        pickup_error = validate_pickup_deadline(
-            values['preparation_time'],
-            values['available_until'],
-            values['pickup_available_until'],
-        )
-        if pickup_error:
-            return jsonify({'error': pickup_error}), 400
-
     allowed_statuses = {
         'available', 'requested', 'accepted', 'collected', 'delivered',
         'completed', 'expired', 'rejected',
@@ -1311,6 +1860,10 @@ def update_donation(donation_id):
     if 'status' in payload and payload['status'] not in allowed_statuses:
         return jsonify({'error': 'Invalid donation status. Use the cancellation endpoint to cancel a donation.'}), 400
     requested_status = payload.get('status', donation.get('status'))
+    if donation.get('status') == 'expired' and requested_status != 'expired':
+        return jsonify({'error': 'Expired donations cannot be reactivated.'}), 409
+    if requested_status == 'expired' and not donation_is_expired(donation):
+        return jsonify({'error': 'Donations expire automatically at their validity end time.'}), 409
     if requested_status == 'completed' and user.get('role') != 'admin':
         return jsonify({'error': 'Donations are marked completed only after delivery is confirmed.'}), 400
     if 'available_until' in payload or 'preparation_time' in payload:
@@ -1363,6 +1916,9 @@ def cancel_donation(donation_id):
             return jsonify({'error': 'Donation not found.'}), 404
         if user.get('role') != 'donor' or donation.get('donor_id') != user.get('id'):
             return jsonify({'error': 'Only the donor who owns this donation can cancel it.'}), 403
+        if expire_donation_if_due(data, donation):
+            save_data(data)
+            return jsonify({'error': 'Expired donations cannot be cancelled or reactivated.'}), 409
         if donation.get('status') == 'cancelled':
             return jsonify({'error': 'This donation has already been cancelled.'}), 409
         if not donation_cancellation_allowed(data, donation):
@@ -1604,9 +2160,10 @@ def delete_donation(donation_id):
     donation = next((item for item in data.get('donations', []) if item.get('id') == donation_id), None)
     if not donation:
         return jsonify({'error': 'Donation not found'}), 404
+    if donation.get('status') == 'expired':
+        return jsonify({'error': 'Expired donations are retained for history and cannot be deleted.'}), 409
     is_owner = user['id'] == donation.get('donor_id')
-    is_visible_to_ngo = user.get('role') == 'ngo' and donation.get('status') in {'available', 'requested', 'accepted'}
-    if not (is_owner or user.get('role') == 'admin' or is_visible_to_ngo):
+    if not (is_owner or user.get('role') == 'admin'):
         return jsonify({'error': 'You are not authorized to delete this donation.'}), 403
 
     deleted_task_ids = {
@@ -1639,20 +2196,93 @@ def delete_donation(donation_id):
     return jsonify({'success': True, 'deleted_id': donation_id})
 
 
-def _food_tokens(value):
-    tokens = re.findall(r'[a-z0-9]+', value.lower())
-    ignored = {'fresh', 'food', 'box', 'boxes', 'pack', 'packet', 'packets', 'serving', 'servings'}
-    aliases = {
-        'biriyani': 'biryani',
-        'rolls': 'roll',
-        'wrap': 'roll',
-        'wraps': 'roll',
-        'fruits': 'fruit',
-        'vegetables': 'vegetable',
-        'veg': 'vegetable',
-        'vegetarian': 'vegetable',
+def _food_terms(value):
+    normalized_value = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', value)
+    tokens = re.findall(r'[a-z0-9]+', normalized_value.lower())
+    normalized = []
+    for token in tokens:
+        if token.endswith('ies') and len(token) > 3:
+            normalized.append(f'{token[:-3]}y')
+        elif token.endswith('s') and len(token) > 3:
+            normalized.append(token[:-1])
+        else:
+            normalized.append(token)
+    return normalized
+
+
+def _food_image_score(food_name, page):
+    requested_terms = _food_terms(food_name)
+    title = re.sub(r'^[^:]+:', '', str(page.get('title') or ''), count=1)
+    title = re.sub(r'\.[a-z0-9]{2,5}$', '', title, flags=re.IGNORECASE)
+    full_title_terms = _food_terms(title)
+    subject_title = re.split(r'[,;:!?]|\.(?=\s|$)', title, maxsplit=1)[0]
+    title_terms = _food_terms(subject_title)
+    if not requested_terms:
+        return None
+
+    excluded_title_terms = {
+        'interior', 'logo', 'menu', 'poster', 'sign', 'icon', 'advertisement',
+        'illustration', 'illustrated', 'drawing', 'cartoon', 'vector', 'clip',
+        'packaging', 'pack', 'packing', 'packed', 'machine', 'make', 'making', 'prepare', 'preparing',
+        'sieve', 'sieving', 'extract', 'extraction', 'recipe', 'process',
+        'production', 'bean', 'leaf', 'plant', 'field', 'cafe',
+        'cafeteria', 'shop', 'center', 'centre', 'bar', 'restaurant', 'hotel',
+        'market', 'store', 'stall', 'building', 'street', 'foodbank', 'brand',
+        'company', 'chain', 'office', 'screenshot',
     }
-    return {aliases.get(token, token) for token in tokens if token not in ignored}
+    if excluded_title_terms.intersection(full_title_terms):
+        return None
+    if '&' in title and '&' not in food_name:
+        return None
+
+    title_lead_ins = {
+        'a', 'an', 'the', 'of', 'home', 'homemade', 'made', 'plate', 'bowl',
+        'glass', 'cup', 'mug', 'jar', 'bottle', 'jug', 'pot', 'serving',
+        'portion', 'piece', 'slice', 'dish', 'close', 'up', 'photo', 'picture',
+        'image', 'fresh', 'traditional', 'prepared', 'cooked', 'with', 'served',
+        'in', 'on', 'style',
+    }
+    scores = []
+    for index in range(len(title_terms) - len(requested_terms) + 1):
+        if title_terms[index:index + len(requested_terms)] != requested_terms:
+            continue
+        preceding_terms = [term for term in title_terms[:index] if term not in title_lead_ins]
+        has_container_context = (
+            index >= 2
+            and title_terms[index - 1] == 'of'
+            and title_terms[index - 2] in {'glass', 'cup', 'mug', 'jar', 'bottle', 'jug'}
+        )
+        if index and title_terms[index - 1] in {'on', 'about', 'near', 'under', 'beside'}:
+            continue
+        if len(preceding_terms) <= 1 or has_container_context:
+            scores.append(sum(
+                term not in requested_terms and term not in title_lead_ins
+                for term in title_terms
+            ))
+    return min(scores) if scores else None
+
+
+def _cached_food_image(food_name):
+    cache_key = ' '.join(food_name.casefold().split())
+    with FOOD_IMAGE_CACHE_LOCK:
+        cached_image = FOOD_IMAGE_CACHE.get(cache_key)
+        if cached_image:
+            expires_at, image_url = cached_image
+            if expires_at > time.monotonic():
+                return image_url
+            del FOOD_IMAGE_CACHE[cache_key]
+    return None
+
+
+def _cache_food_image(food_name, image_url):
+    cache_key = ' '.join(food_name.casefold().split())
+    with FOOD_IMAGE_CACHE_LOCK:
+        if len(FOOD_IMAGE_CACHE) >= 256:
+            FOOD_IMAGE_CACHE.pop(next(iter(FOOD_IMAGE_CACHE)))
+        FOOD_IMAGE_CACHE[cache_key] = (
+            time.monotonic() + FOOD_IMAGE_CACHE_TTL_SECONDS,
+            image_url,
+        )
 
 
 def _image_bytes_extension(image_bytes):
@@ -1665,188 +2295,89 @@ def _image_bytes_extension(image_bytes):
     return None
 
 
-def generate_cached_food_image(food_name):
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        app.logger.info('Gemini food-image generation is not configured.')
-        return None
-
-    cache_key = hashlib.sha256(
-        f'{AI_IMAGE_MODEL}:realistic-food-v1:{food_name.strip().casefold()}'.encode('utf-8')
-    ).hexdigest()
-    cache_prefix = f'ai-food-{cache_key}'
-
-    with AI_IMAGE_CACHE_LOCK:
-        for extension in ('.png', '.jpg', '.webp'):
-            cached_path = UPLOAD_DIR / f'{cache_prefix}{extension}'
-            if cached_path.is_file() and cached_path.stat().st_size:
-                return f'/uploads/{cached_path.name}'
-
-        prompt = (
-            f'Create a realistic, appetizing documentary food photograph of {food_name}. '
-            'Show only the specified food, freshly prepared and served naturally, with '
-            'soft daylight, believable food texture, a simple neutral background, and '
-            'professional natural food photography. This is an illustrative image, not '
-            'a photograph of a specific donor donation. Do not add text, logos, cartoons, '
-            'illustrations, people, or unrelated foods.'
-        )
-        try:
-            response = requests.post(
-                'https://generativelanguage.googleapis.com/v1beta/interactions',
-                headers={
-                    'x-goog-api-key': api_key,
-                    'Content-Type': 'application/json',
-                },
-                json={'model': AI_IMAGE_MODEL, 'input': prompt},
-                timeout=90,
-            )
-            response.raise_for_status()
-            result = response.json()
-            image_result = result.get('output_image')
-            if not isinstance(image_result, dict):
-                image_result = next(
-                    (
-                        item for item in result.get('outputs', [])
-                        if isinstance(item, dict) and item.get('type') == 'image'
-                    ),
-                    None,
-                )
-            encoded_image = image_result.get('data') if isinstance(image_result, dict) else None
-            if not encoded_image:
-                app.logger.warning('Gemini food-image response contained no image data.')
-                return None
-
-            image_bytes = base64.b64decode(encoded_image, validate=True)
-            extension = _image_bytes_extension(image_bytes)
-            if not extension:
-                app.logger.warning('Gemini food-image response was not a supported image format.')
-                return None
-
-            file_name = f'{cache_prefix}{extension}'
-            target_path = UPLOAD_DIR / file_name
-            temporary_path = UPLOAD_DIR / f'{file_name}.{uuid.uuid4().hex}.tmp'
-            try:
-                temporary_path.write_bytes(image_bytes)
-                temporary_path.replace(target_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
-            return f'/uploads/{file_name}'
-        except requests.RequestException as error:
-            response = error.response
-            if response is not None:
-                try:
-                    error_payload = response.json()
-                except ValueError:
-                    error_payload = {}
-                provider_error = error_payload.get('error') if isinstance(error_payload, dict) else None
-                provider_message = provider_error.get('message') if isinstance(provider_error, dict) else None
-                if isinstance(provider_message, str) and provider_message:
-                    if api_key in provider_message:
-                        provider_message = provider_message.replace(api_key, '[REDACTED]')
-                    app.logger.warning(
-                        'Gemini food-image generation request failed (HTTP %s): %s',
-                        response.status_code,
-                        provider_message,
-                    )
-                    return None
-            app.logger.warning('Gemini food-image generation request failed: %s', error)
-        except (ValueError, TypeError, KeyError, binascii.Error) as error:
-            app.logger.warning('Gemini food-image generation returned invalid data: %s', error)
-        except OSError as error:
-            app.logger.warning('Could not cache generated food image: %s', error)
-        return None
-
-
+@app.route('/api/food-image', methods=['GET'])
 @app.route('/api/images/search', methods=['GET'])
 def search_food_image():
     user = current_user_from_auth()
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
 
-    food_name = (request.args.get('query') or '').strip()
+    food_name = (request.args.get('food_name') or request.args.get('query') or '').strip()
     if not food_name:
         return jsonify({'error': 'A food name is required.'}), 400
     if len(food_name) > 100:
         return jsonify({'error': 'Food name must be 100 characters or fewer.'}), 400
 
-    try:
-        response = requests.get(
-            'https://commons.wikimedia.org/w/api.php',
-            params={
-                'action': 'query',
-                'generator': 'search',
-                'gsrsearch': f'filetype:bitmap "{food_name}"',
-                'gsrnamespace': 6,
-                'gsrlimit': 10,
-                'prop': 'imageinfo',
-                'iiprop': 'url',
-                'iiurlwidth': 900,
-                'format': 'json',
-            },
-            headers={'User-Agent': 'SmartFoodRedistribution/1.0 (food image matching)'},
-            timeout=8,
-        )
-        response.raise_for_status()
-        requested_tokens = _food_tokens(food_name)
-        search_queries = [food_name]
-        normalized_query = ' '.join(sorted(requested_tokens))
-        if normalized_query and normalized_query.lower() != food_name.lower():
-            search_queries.append(normalized_query)
+    cached_image = _cached_food_image(food_name)
+    if cached_image:
+        return jsonify({'image_url': cached_image, 'source': 'image_provider'})
 
-        for search_query in search_queries:
-            if search_query != food_name:
-                response = requests.get(
-                    'https://commons.wikimedia.org/w/api.php',
-                    params={
-                        'action': 'query',
-                        'generator': 'search',
-                        'gsrsearch': f'filetype:bitmap "{search_query}"',
-                        'gsrnamespace': 6,
-                        'gsrlimit': 10,
-                        'prop': 'imageinfo',
-                        'iiprop': 'url',
-                        'iiurlwidth': 900,
-                        'format': 'json',
-                    },
-                    headers={'User-Agent': 'SmartFoodRedistribution/1.0 (food image matching)'},
-                    timeout=8,
-                )
-                response.raise_for_status()
+    search_queries = (
+        f'filetype:bitmap "{food_name}" food',
+        f'filetype:bitmap "{food_name}" drink',
+        f'filetype:bitmap "{food_name}" beverage',
+        f'filetype:bitmap "glass of {food_name}"',
+    )
+    best_image = None
+    for search_query in search_queries:
+        try:
+            response = requests.get(
+                'https://commons.wikimedia.org/w/api.php',
+                params={
+                    'action': 'query',
+                    'generator': 'search',
+                    'gsrsearch': search_query,
+                    'gsrnamespace': 6,
+                    'gsrlimit': 50,
+                    'prop': 'imageinfo',
+                    'iiprop': 'url',
+                    'iiurlwidth': 900,
+                    'format': 'json',
+                },
+                headers={
+                    'User-Agent': (
+                        'SmartFoodRedistribution/1.0 '
+                        '(https://github.com/sandhya24sana/smart-food-donation-redistribution)'
+                    ),
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
             pages = response.json().get('query', {}).get('pages', {}).values()
+            candidates = []
             for page in pages:
-                title_tokens = _food_tokens(page.get('title', ''))
-                if not requested_tokens or not requested_tokens.issubset(title_tokens):
+                score = _food_image_score(food_name, page)
+                if score is None:
                     continue
                 image_info = (page.get('imageinfo') or [{}])[0]
                 image_url = image_info.get('thumburl') or image_info.get('url')
-                if image_url:
-                    return jsonify({
-                        'image_url': image_url,
-                        'source': 'Wikimedia Commons',
-                        'image_source': 'search',
-                        'is_ai_generated': False,
-                    })
-    except requests.RequestException as error:
-        app.logger.warning('Food image lookup failed: %s', error)
-    except (ValueError, TypeError, AttributeError) as error:
-        app.logger.warning('Food image lookup returned invalid data: %s', error)
+                if isinstance(image_url, str):
+                    parsed_image_url = urlsplit(image_url)
+                else:
+                    parsed_image_url = None
+                if (
+                    parsed_image_url
+                    and parsed_image_url.scheme == 'https'
+                    and parsed_image_url.hostname in {'upload.wikimedia.org', 'thumb.wikimedia.org'}
+                ):
+                    candidates.append((score, image_url))
+            if candidates:
+                candidate = min(candidates, key=lambda item: item[0])
+                if best_image is None or candidate[0] < best_image[0]:
+                    best_image = candidate
+                if best_image[0] == 0:
+                    break
+        except requests.RequestException as error:
+            app.logger.warning('Food image lookup failed: %s', error)
+            break
+        except (ValueError, TypeError, AttributeError) as error:
+            app.logger.warning('Food image lookup returned invalid data: %s', error)
 
-    generated_image_url = generate_cached_food_image(food_name)
-    if generated_image_url:
-        return jsonify({
-            'image_url': generated_image_url,
-            'source': 'Gemini',
-            'image_source': 'ai_generated',
-            'is_ai_generated': True,
-            'label': 'AI-generated illustrative image',
-        })
-    return jsonify({
-        'image_url': None,
-        'source': None,
-        'image_source': None,
-        'is_ai_generated': False,
-    })
-
+    if best_image:
+        _, image_url = best_image
+        _cache_food_image(food_name, image_url)
+        return jsonify({'image_url': image_url, 'source': 'image_provider'})
+    return jsonify({'image_url': None, 'source': 'placeholder'})
 
 @app.route('/api/donation-requests', methods=['GET'])
 def list_requests():
@@ -1931,6 +2462,9 @@ def list_requests():
                 'contact_phone': donation.get('contact_phone', ''),
                 'available_until': donation.get('available_until', ''),
                 'pickup_available_until': donation.get('pickup_available_until', ''),
+                'status': donation.get('status', ''),
+                'distributed_quantity': donation_distributed_quantity(data, donation),
+                'remaining_quantity': donation_remaining_quantity(data, donation),
             }
             if user.get('role') == 'ngo':
                 donation_details.update({
@@ -1948,8 +2482,8 @@ def list_requests():
             donor_inventory = [
                 item for item in data.get('donations', [])
                 if item.get('donor_id') == user['id']
+                and donation_is_requestable(data, item)
                 and donation_matches_food_request(item, request_item)
-                and item.get('status') in {'available', 'requested', 'accepted'}
             ]
             request_item['donor_available_quantity'] = sum(
                 donation_available_quantity(data, item)
@@ -2047,7 +2581,7 @@ def list_requests():
                 ]
                 visible_issues = [
                     entry for entry in issues_by_task.get(task.get('id'), [])
-                    if user.get('role') == 'ngo' or delivery_issue_reporter_id(entry) == user.get('id')
+                    if user.get('role') == 'ngo' or entry.get('receiver_id') == user.get('id')
                 ]
                 request_item['delivery_tasks'].append({
                     'id': task.get('id'),
@@ -2083,20 +2617,23 @@ def create_request():
         return jsonify({'error': 'A valid requested quantity is required.'}), 400
     if not math.isfinite(quantity_value) or quantity_value <= 0:
         return jsonify({'error': 'Requested quantity must be positive.'}), 400
+    delivery_location = str(payload.get('delivery_location') or '').strip()
+    if not delivery_location:
+        return jsonify({'error': 'A delivery location is required for a food request.'}), 400
 
     data = load_data()
+    if expire_due_donations(data):
+        save_data(data)
     donation = None
     if donation_id:
         donation = next((d for d in data['donations'] if d['id'] == donation_id), None)
         if not donation:
             return jsonify({'error': 'Donation not found.'}), 404
-        if donation['status'] not in {'available', 'requested', 'accepted'}:
+        if not donation_is_requestable(data, donation):
             return jsonify({'error': 'This donation is not available for new requests.'}), 400
     else:
         if not str(payload.get('quantity_unit') or '').strip():
             return jsonify({'error': 'A quantity unit is required for a food request.'}), 400
-        if not str(payload.get('delivery_location') or '').strip():
-            return jsonify({'error': 'A delivery location is required for a food request.'}), 400
 
     if donation:
         available_quantity = donation_available_quantity(data, donation)
@@ -2121,7 +2658,6 @@ def create_request():
     if not food_name:
         return jsonify({'error': 'Food name is required.'}), 400
     purpose = str(payload.get('purpose') or 'Community distribution').strip()
-    delivery_location = str(payload.get('delivery_location') or '').strip()
     request_item = {
         'id': f'request-{uuid.uuid4().hex}',
         'donation_id': donation_id,
@@ -2184,6 +2720,8 @@ def create_request_contribution(request_id):
         return jsonify({'error': 'Contribution quantity must be greater than zero.'}), 400
 
     data = load_data()
+    if expire_due_donations(data):
+        save_data(data)
     request_item = next(
         (item for item in data.get('donation_requests', []) if item.get('id') == request_id),
         None,
@@ -2201,7 +2739,7 @@ def create_request_contribution(request_id):
     )
     if not donation:
         return jsonify({'error': 'Select one of your own food donations.'}), 404
-    if donation.get('status') not in {'available', 'requested', 'accepted'}:
+    if not donation_is_requestable(data, donation):
         return jsonify({'error': 'This donation is not available for contribution.'}), 409
     if not donation_matches_food_request(donation, request_item):
         return jsonify({'error': 'Select a donation matching the requested food category or name and quantity unit.'}), 400
@@ -2232,20 +2770,7 @@ def create_request_contribution(request_id):
     if quantity > requested_quantity - contributed_quantity:
         return jsonify({'error': 'Contribution exceeds the request’s remaining quantity.'}), 409
 
-    allocated_from_donation = sum(
-        float(item.get('quantity', 0) or 0)
-        for item in contributions
-        if item.get('donation_id') == donation_id
-        and item.get('status') not in {'cancelled', 'rejected'}
-    )
-    legacy_request_allocations = sum(
-        float(item.get('requested_quantity', 0) or 0)
-        for item in data.get('donation_requests', [])
-        if item.get('donation_id') == donation_id
-        and not item.get('multi_contribution')
-        and item.get('status') not in {'rejected', 'cancelled'}
-    )
-    remaining_donation = float(donation.get('quantity', 0) or 0) - allocated_from_donation - legacy_request_allocations
+    remaining_donation = donation_available_quantity(data, donation)
     if quantity > remaining_donation:
         return jsonify({'error': 'Contribution exceeds the unallocated quantity of your donation.'}), 409
 
@@ -2341,6 +2866,11 @@ def assign_request_contribution(request_id, contribution_id):
     )
     if not donation:
         return jsonify({'error': 'The donor’s food listing is no longer available.'}), 404
+    if expire_donation_if_due(data, donation):
+        save_data(data)
+        return jsonify({'error': 'This donation has expired and cannot be assigned for delivery.'}), 409
+    if not donation_can_continue_distribution(data, donation):
+        return jsonify({'error': 'This donation is outside its validity period or has no remaining food.'}), 409
     if not volunteer:
         return jsonify({'error': 'Available volunteer not found.'}), 404
     if any(
@@ -2458,6 +2988,13 @@ def update_request(request_id):
     if can_review_request:
         if new_status not in {'approved', 'rejected'}:
             return jsonify({'error': 'Requests can only be approved or rejected.'}), 400
+
+        if new_status == 'approved' and donation:
+            if expire_donation_if_due(data, donation):
+                save_data(data)
+                return jsonify({'error': 'This donation has expired and the request cannot be accepted.'}), 409
+            if not donation_can_continue_distribution(data, donation):
+                return jsonify({'error': 'This donation is outside its validity period or has no remaining food.'}), 409
 
         previous_status = request_item.get('status')
         set_request_status(request_item, new_status, user['id'])
@@ -2604,9 +3141,22 @@ def list_delivery_tasks():
     data = load_data()
     tasks = data.get('delivery_tasks', [])
     if user['role'] == 'volunteer':
+        donations_by_id = {
+            donation.get('id'): donation for donation in data.get('donations', [])
+        }
         tasks = [
             task for task in tasks
-            if task.get('status') == 'open' or task.get('volunteer_id') == user['id']
+            if task.get('volunteer_id') == user['id']
+            or (
+                task.get('status') == 'open'
+                and (
+                    not delivery_task_donation_id(data, task)
+                    or donation_can_continue_distribution(
+                        data,
+                        donations_by_id.get(delivery_task_donation_id(data, task), {}),
+                    )
+                )
+            )
         ]
     elif user['role'] == 'ngo':
         tasks = [task for task in tasks if task.get('ngo_id') == user['id']]
@@ -2674,7 +3224,10 @@ def list_delivery_tasks():
             ]
         task['feedback'] = task_feedback
         task['issues'] = task_issues
-        request_item = delivery_task_request(data, task)
+        request_item = next(
+            (item for item in data.get('donation_requests', []) if item.get('id') == task.get('request_id')),
+            None,
+        )
         if user.get('role') == 'ngo' and request_item:
             receiver = profiles_by_id.get(request_item.get('requester_id', request_item.get('ngo_id')), {})
             task['receiver_name'] = receiver.get('organization_name') or receiver.get('full_name', 'Food receiver')
@@ -2690,9 +3243,8 @@ def create_delivery_task():
 
     payload = request.get_json(silent=True) or {}
     request_id = str(payload.get('request_id') or '').strip()
-    dropoff_location = str(payload.get('dropoff_location') or '').strip()
-    if not request_id or not dropoff_location:
-        return jsonify({'error': 'An approved request and drop-off location are required.'}), 400
+    if not request_id:
+        return jsonify({'error': 'An approved request is required.'}), 400
 
     data = load_data()
     request_item = next(
@@ -2707,6 +3259,22 @@ def create_delivery_task():
         return jsonify({'error': 'Coordinate this approved request before creating its delivery task.'}), 403
     if not request_item.get('requester_id') and request_item.get('ngo_id') != user['id']:
         return jsonify({'error': 'This request is not part of your organization’s distribution work.'}), 403
+    saved_delivery_location = str(request_item.get('delivery_location') or '').strip()
+    if request_item.get('requester_id'):
+        if not saved_delivery_location:
+            return jsonify({'error': 'The requester must provide a delivery location before a delivery task can be created.'}), 400
+        dropoff_location = saved_delivery_location
+    else:
+        dropoff_location = str(payload.get('dropoff_location') or '').strip()
+        if not dropoff_location:
+            return jsonify({'error': 'A drop-off location is required for this request.'}), 400
+
+    task_deadline = delivery_task_deadline(data, {
+        'request_id': request_id,
+        'donation_id': request_item.get('donation_id'),
+    })
+    if task_deadline is not None and task_deadline <= datetime.now().astimezone():
+        return jsonify({'error': 'The scheduled delivery deadline has passed; a delivery task cannot be created.'}), 409
 
     donation = next(
         (item for item in data.get('donations', []) if item.get('id') == request_item.get('donation_id')),
@@ -2714,8 +3282,11 @@ def create_delivery_task():
     )
     if not donation:
         return jsonify({'error': 'The donation for this request no longer exists.'}), 404
-    if donation.get('status') == 'cancelled':
-        return jsonify({'error': 'Cancelled donations cannot be assigned to a delivery task.'}), 409
+    if expire_donation_if_due(data, donation):
+        save_data(data)
+        return jsonify({'error': 'Expired donations cannot be assigned to a delivery task.'}), 409
+    if not donation_can_continue_distribution(data, donation):
+        return jsonify({'error': 'This donation is outside its validity period or has no remaining food.'}), 409
     if any(
         task.get('request_id') == request_id and task.get('status') != 'delivered'
         for task in data.get('delivery_tasks', [])
@@ -2756,18 +3327,31 @@ def create_delivery_task():
 
 
 @app.route('/api/delivery-tasks/<task_id>/accept', methods=['POST'])
+@serialize_request_contribution_updates
 def accept_delivery_task(task_id):
     user = current_user_from_auth()
     if not user or user['role'] != 'volunteer':
         return jsonify({'error': 'Only volunteers can accept delivery tasks.'}), 403
 
     data = load_data()
+    if expire_due_donations(data):
+        save_data(data)
     task = next(
         (item for item in data.get('delivery_tasks', []) if item.get('id') == task_id),
         None,
     )
     if not task:
         return jsonify({'error': 'Delivery task not found.'}), 404
+    donation_id = delivery_task_donation_id(data, task)
+    donation = next(
+        (item for item in data.get('donations', []) if item.get('id') == donation_id),
+        None,
+    )
+    if donation and expire_donation_if_due(data, donation):
+        save_data(data)
+        return jsonify({'error': 'This delivery task is linked to expired food and cannot be accepted.'}), 409
+    if donation and not donation_can_continue_distribution(data, donation):
+        return jsonify({'error': 'This delivery task is outside the food validity period.'}), 409
     if task.get('status') == 'cancelled':
         return jsonify({'error': 'This delivery task was cancelled and cannot be accepted.'}), 409
     can_accept_open_task = task.get('status') == 'open' and not task.get('volunteer_id')
@@ -2776,17 +3360,22 @@ def accept_delivery_task(task_id):
         return jsonify({'error': 'This delivery task has already been accepted.'}), 409
 
     task['volunteer_id'] = user['id']
-    task['status'] = 'accepted'
+    task['volunteer_name'] = user.get('full_name', '')
+    task['status'] = 'assigned' if can_accept_open_task else 'accepted'
     task['updated_at'] = utc_now()
     task.setdefault('status_history', []).append({
-        'status': 'accepted',
+        'status': task['status'],
         'changed_by': user['id'],
         'created_at': task['updated_at'],
     })
     data.setdefault('notifications', []).append({
         'id': f'notify-{uuid.uuid4().hex[:8]}',
         'user_id': task['ngo_id'],
-        'message': f'{user["full_name"]} accepted a delivery task.',
+        'message': (
+            f'{user["full_name"]} was assigned a delivery task.'
+            if can_accept_open_task
+            else f'{user["full_name"]} accepted a delivery task.'
+        ),
         'type': 'delivery',
         'link': '/dashboard',
         'read_at': None,
@@ -2837,11 +3426,14 @@ def update_delivery_task(task_id):
     if task.get('status') == 'cancelled':
         return jsonify({'error': 'This delivery task was cancelled and cannot be advanced.'}), 409
     donation = next(
-        (item for item in data.get('donations', []) if item.get('id') == task.get('donation_id')),
+        (item for item in data.get('donations', []) if item.get('id') == delivery_task_donation_id(data, task)),
         None,
-    ) if task.get('donation_id') else None
-    if donation and donation.get('status') == 'cancelled':
-        return jsonify({'error': 'This delivery task is linked to a cancelled donation.'}), 409
+    )
+    if donation and expire_donation_if_due(data, donation):
+        save_data(data)
+        return jsonify({'error': 'This delivery task is linked to expired food and cannot be advanced.'}), 409
+    if donation and not donation_can_continue_distribution(data, donation):
+        return jsonify({'error': 'This delivery task is outside the food validity period.'}), 409
     if transitions.get(task.get('status')) != next_status:
         return jsonify({'error': 'Delivery status must advance one step at a time.'}), 400
 
@@ -2898,11 +3490,31 @@ def update_delivery_task(task_id):
                         'changed_by': user['id'],
                     })
         donation = next(
-            (item for item in data.get('donations', []) if item.get('id') == task.get('donation_id')),
+            (
+                item for item in data.get('donations', [])
+                if item.get('id') == delivery_task_donation_id(data, task)
+            ),
             None,
-        ) if task.get('donation_id') else None
+        )
+        other_open_requests = any(
+            item.get('donation_id') == task.get('donation_id')
+            and item.get('status') in {'pending', 'approved', 'accepted'}
+            for item in data.get('donation_requests', [])
+        )
+        other_undelivered_contributions = any(
+            item.get('donation_id') == task.get('donation_id')
+            and item.get('status') not in {'delivered', 'cancelled', 'rejected'}
+            for item in data.get('request_contributions', [])
+        )
         if donation:
-            sync_donation_delivery_status(data, donation, user['id'])
+            expire_donation_if_due(data, donation)
+            if not other_open_requests and not other_undelivered_contributions:
+                sync_donation_request_status(
+                    data,
+                    donation,
+                    user['id'],
+                    'A food delivery completed; some original quantity remains',
+                )
         if donation:
             create_donor_certificates(data, donation.get('donor_id'))
         if request_item and not request_item.get('multi_contribution'):
@@ -3051,8 +3663,15 @@ def donor_certificates():
     created_certificates = create_donor_certificates(data, user['id'])
     if created_certificates['changed']:
         save_data(data)
-    completed_donations = donor_completed_donations(data, user['id'])
-    completed_count = len(completed_donations)
+    completed_count = len(donor_completed_donations(data, user['id']))
+    donor_certificates = [
+        item for item in data.get('donation_certificates', [])
+        if item.get('donor_id') == user['id']
+        and (
+            item.get('certificate_type') == 'donation'
+            or (item.get('donation_id') and not item.get('milestone'))
+        )
+    ]
     milestone_targets = {
         milestone['key']: target
         for target, milestone in DONATION_MILESTONES.items()
@@ -3066,6 +3685,7 @@ def donor_certificates():
         and int(item.get('completed_donations', item.get('completed_deliveries', 0)) or 0)
         == milestone_targets[item['milestone']]
     ]
+    donor_certificates.sort(key=lambda item: (item.get('delivery_date') or '', item.get('donation_id') or ''))
     milestone_certificates.sort(key=lambda item: item.get('completed_donations', 0))
     milestone_progress = [
         {
@@ -3085,11 +3705,214 @@ def donor_certificates():
     return jsonify({
         'completed_donations': completed_count,
         'completed_deliveries': completed_count,
-        'donation_certificates': [],
+        'donation_certificates': donor_certificates,
         'milestone_certificates': milestone_certificates,
         'milestones': milestone_progress,
         'next_milestone': next_milestone,
     })
+
+
+@app.route('/api/certificates/download', methods=['POST'])
+def download_certificate_pdf():
+    user = current_user_from_auth()
+    if not user:
+        return jsonify({'error': 'Authentication required'}), 401
+
+    payload = request.get_json(silent=True) if request.is_json else None
+    payload = payload or request.form
+    certificate_id = str(payload.get('certificate_id') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', certificate_id):
+        return jsonify({'error': 'A valid certificate ID is required.'}), 400
+
+    if user.get('role') == 'donor':
+        data = load_data()
+        owns_certificate = any(
+            item.get('donor_id') == user.get('id')
+            and item.get('certificate_id') == certificate_id
+            for item in data.get('donation_certificates', [])
+        )
+        if not owns_certificate:
+            return jsonify({'error': 'Certificate not found for this donor.'}), 404
+    elif user.get('role') == 'volunteer':
+        if not certificate_id.startswith('SFDRS-VOL-') or payload is None:
+            return jsonify({'error': 'Certificate not found for this volunteer.'}), 404
+    else:
+        return jsonify({'error': 'Only donors and volunteers can download certificates.'}), 403
+
+    if request.is_json:
+        if user.get('role') != 'volunteer':
+            return jsonify({'error': 'Only volunteers can generate certificates through this endpoint.'}), 403
+        recipient_name = str(payload.get('recipient_name') or user.get('full_name') or '').strip()
+        issue_date = str(payload.get('issue_date') or '').strip()
+        delivery_count = payload.get('completed_deliveries')
+        if (
+            not recipient_name
+            or len(recipient_name) > 300
+            or not issue_date
+            or len(issue_date) > 100
+            or type(delivery_count) is not int
+            or delivery_count < 0
+        ):
+            return jsonify({'error': 'Volunteer certificate details are incomplete or invalid.'}), 400
+        pdf_content = create_volunteer_certificate_pdf(
+            recipient_name,
+            delivery_count,
+            issue_date,
+            certificate_id,
+        )
+    else:
+        certificate_file = request.files.get('certificate_pdf')
+        if not certificate_file:
+            return jsonify({'error': 'A generated PDF certificate is required.'}), 400
+        pdf_content = certificate_file.stream.read(MAX_UPLOAD_SIZE_BYTES + 1)
+        if len(pdf_content) > MAX_UPLOAD_SIZE_BYTES:
+            return jsonify({'error': 'The certificate PDF exceeds the maximum allowed size.'}), 413
+        if not pdf_content.startswith(b'%PDF-') or not pdf_content.rstrip().endswith(b'%%EOF'):
+            return jsonify({'error': 'The uploaded certificate is not a valid PDF file.'}), 400
+
+    if len(pdf_content) > MAX_UPLOAD_SIZE_BYTES:
+        return jsonify({'error': 'The generated certificate PDF exceeds the maximum allowed size.'}), 413
+
+    return send_file(
+        io.BytesIO(pdf_content),
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'{certificate_id}.pdf',
+        max_age=0,
+    )
+
+
+def create_volunteer_certificate_pdf(recipient_name, completed_deliveries, issue_date, certificate_id):
+    page_width, page_height = landscape(A4)
+    buffer = io.BytesIO()
+    document = canvas.Canvas(buffer, pagesize=(page_width, page_height), pageCompression=1)
+    green = colors.HexColor('#164638')
+    gold = colors.HexColor('#b79a5c')
+    paper = colors.HexColor('#fbf9f1')
+    muted = colors.HexColor('#60685f')
+
+    document.setFillColor(paper)
+    document.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+    document.setStrokeColor(green)
+    document.setLineWidth(9)
+    document.rect(13, 13, page_width - 26, page_height - 26, fill=0, stroke=1)
+    document.setStrokeColor(gold)
+    document.setLineWidth(2)
+    document.rect(24, 24, page_width - 48, page_height - 48, fill=0, stroke=1)
+    document.setStrokeColor(green)
+    document.setLineWidth(1)
+    document.rect(32, 32, page_width - 64, page_height - 64, fill=0, stroke=1)
+
+    for x, y, horizontal, vertical in (
+        (42, page_height - 42, 1, -1),
+        (page_width - 42, page_height - 42, -1, -1),
+        (42, 42, 1, 1),
+        (page_width - 42, 42, -1, 1),
+    ):
+        document.setStrokeColor(gold)
+        document.setLineWidth(2)
+        document.line(x, y, x + 30 * horizontal, y)
+        document.line(x, y, x, y + 30 * vertical)
+
+    center_x = page_width / 2
+    emblem_y = page_height - 64
+    document.setFillColor(green)
+    document.circle(center_x, emblem_y, 24, fill=1, stroke=0)
+    document.setStrokeColor(gold)
+    document.setLineWidth(1.2)
+    document.circle(center_x, emblem_y, 20, fill=0, stroke=1)
+    document.setStrokeColor(colors.HexColor('#f7efd9'))
+    document.setLineWidth(1.6)
+    emblem_scale = 30.3 / 64
+
+    def emblem_point(x, y):
+        return center_x + (x - 32) * emblem_scale, emblem_y + (32 - y) * emblem_scale
+
+    plate = document.beginPath()
+    plate.moveTo(*emblem_point(12, 38))
+    plate.curveTo(*emblem_point(21, 30), *emblem_point(43, 30), *emblem_point(52, 38))
+    plate.lineTo(*emblem_point(52, 48))
+    plate.lineTo(*emblem_point(12, 48))
+    plate.close()
+    document.setFillColor(colors.HexColor('#d8bd7e'))
+    document.drawPath(plate, fill=1, stroke=0)
+
+    leaves = document.beginPath()
+    leaves.moveTo(*emblem_point(16, 37))
+    leaves.curveTo(*emblem_point(25, 31), *emblem_point(39, 31), *emblem_point(48, 37))
+    leaves.moveTo(*emblem_point(24, 32))
+    leaves.curveTo(*emblem_point(18, 24), *emblem_point(20, 16), *emblem_point(26, 12))
+    leaves.curveTo(*emblem_point(32, 18), *emblem_point(33, 24), *emblem_point(30, 31))
+    leaves.moveTo(*emblem_point(33, 31))
+    leaves.curveTo(*emblem_point(31, 20), *emblem_point(35, 12), *emblem_point(42, 9))
+    leaves.curveTo(*emblem_point(46, 17), *emblem_point(44, 24), *emblem_point(39, 32))
+    leaves.moveTo(*emblem_point(41, 34))
+    leaves.curveTo(*emblem_point(43, 26), *emblem_point(49, 22), *emblem_point(56, 23))
+    leaves.curveTo(*emblem_point(56, 30), *emblem_point(52, 35), *emblem_point(44, 38))
+    leaves.moveTo(*emblem_point(20, 53))
+    leaves.lineTo(*emblem_point(44, 53))
+    document.setStrokeColor(colors.HexColor('#f7efd9'))
+    document.setLineWidth(1.2)
+    document.setLineCap(1)
+    document.drawPath(leaves, fill=0, stroke=1)
+
+    def draw_paragraph(text, y_center, width, font, size, color, alignment=TA_CENTER, leading=None):
+        style = ParagraphStyle(
+            name='certificate-text',
+            fontName=font,
+            fontSize=size,
+            leading=leading or size * 1.25,
+            textColor=color,
+            alignment=alignment,
+        )
+        paragraph = Paragraph(escape(str(text)), style)
+        _, height = paragraph.wrap(width, page_height)
+        paragraph.drawOn(document, center_x - width / 2, y_center - height / 2)
+
+    draw_paragraph('SMART FOOD DONATION AND REDISTRIBUTION SYSTEM', page_height - 111, page_width - 130, 'Helvetica-Bold', 9, colors.HexColor('#806938'))
+    draw_paragraph('Certificate of Appreciation', page_height - 151, page_width - 120, 'Times-Roman', 30, green)
+    document.setStrokeColor(gold)
+    document.setLineWidth(1)
+    document.line(page_width * .27, page_height - 169, page_width * .73, page_height - 169)
+
+    draw_paragraph('Presented with gratitude to', page_height - 202, page_width - 140, 'Helvetica', 11, muted)
+    draw_paragraph(recipient_name, page_height - 245, page_width - 150, 'Times-Bold', 36, green, leading=42)
+    draw_paragraph('For dedicated service to community food redistribution', page_height - 286, page_width - 140, 'Times-Italic', 13, colors.HexColor('#344b3f'))
+    draw_paragraph('Successfully completed deliveries', page_height - 313, page_width - 140, 'Helvetica-Bold', 9, colors.HexColor('#856d3a'))
+    draw_paragraph(f'{completed_deliveries:,}', page_height - 340, page_width - 140, 'Helvetica-Bold', 20, green)
+    draw_paragraph('Community Food Redistribution Project', page_height - 365, page_width - 140, 'Helvetica', 10, muted)
+    draw_paragraph(
+        'With gratitude for carrying nourishing food to neighbors and strengthening our community through dependable service.',
+        page_height - 395,
+        page_width - 210,
+        'Times-Roman',
+        10,
+        colors.HexColor('#4f5b51'),
+        leading=14,
+    )
+
+    footer_y = 69
+    signature_x = 185
+    document.setStrokeColor(colors.HexColor('#697368'))
+    document.setLineWidth(0.8)
+    document.line(signature_x - 85, footer_y + 19, signature_x + 85, footer_y + 19)
+    document.setFillColor(colors.HexColor('#344b3f'))
+    document.setFont('Times-Italic', 11)
+    document.drawCentredString(signature_x, footer_y + 5, 'Project Coordinator')
+    document.setFillColor(colors.HexColor('#777b71'))
+    document.setFont('Helvetica-Bold', 7)
+    document.drawCentredString(signature_x, footer_y - 8, 'AUTHORIZED SIGNATURE')
+
+    document.setFillColor(colors.HexColor('#667067'))
+    document.setFont('Helvetica', 7)
+    document.drawRightString(page_width - 54, footer_y + 13, f'ACHIEVEMENT DATE  ·  {issue_date}')
+    document.drawRightString(page_width - 54, footer_y, f'ISSUE DATE  ·  {issue_date}')
+    document.drawRightString(page_width - 54, footer_y - 13, f'CERTIFICATE ID  ·  {certificate_id}')
+
+    document.showPage()
+    document.save()
+    buffer.seek(0)
+    return buffer.read()
 
 
 @app.route('/api/volunteer/leaderboard', methods=['GET'])
@@ -3301,24 +4124,10 @@ def delivery_task_feedback(task_id):
             visible_issues = [
                 item for item in data.get('delivery_issues', [])
                 if item.get('task_id') == task_id
-                and (user.get('role') == 'ngo' or delivery_issue_reporter_id(item) == user['id'])
+                and (user.get('role') == 'ngo' or item.get('receiver_id') == user['id'])
             ]
-        donation_id = delivery_task_donation_id(data, task)
-        donation = next(
-            (item for item in data.get('donations', []) if item.get('id') == donation_id),
-            None,
-        )
-        task_context = task.copy()
-        task_context['donation'] = {
-            key: donation.get(key)
-            for key in ('id', 'food_name', 'category', 'quantity', 'quantity_unit')
-        } if donation else None
-        task_context['request'] = {
-            key: request_item.get(key)
-            for key in ('id', 'food_name', 'requested_quantity', 'quantity_unit', 'status')
-        } if request_item else None
         return jsonify({
-            'task': task_context,
+            'task': task,
             'feedback': visible,
             'my_feedback': next((item for item in visible if item.get('author_id') == user['id']), None),
             'has_feedback': any(item.get('task_id') == task_id for item in feedback_entries),
@@ -3485,6 +4294,22 @@ def update_delivery_feedback(feedback_id):
     return jsonify({'feedback': entry})
 
 
+@app.route('/api/delivery-issues', methods=['GET'])
+def list_delivery_issues():
+    user = current_user_from_auth()
+    if not user:
+        return jsonify({'error': 'Authentication required'}), 401
+
+    data = load_data()
+    visible_issues = []
+    for issue in data.get('delivery_issues', []):
+        task, request_item, donation = delivery_issue_context(data, issue)
+        if delivery_issue_visible_to_user(user, issue, task, request_item, donation):
+            visible_issues.append(serialize_delivery_issue(data, issue))
+    visible_issues.sort(key=lambda item: item.get('created_at') or '', reverse=True)
+    return jsonify({'issues': visible_issues})
+
+
 @app.route('/api/delivery-tasks/<task_id>/issues', methods=['GET', 'POST'])
 def delivery_task_issues(task_id):
     user = current_user_from_auth()
@@ -3500,79 +4325,50 @@ def delivery_task_issues(task_id):
         None,
     )
     if request.method == 'POST':
-        donor_report = (
-            user.get('role') == 'donor'
-            and delivery_task_owned_by_donor(data, task, user.get('id'))
-        )
-        requester_report = (
-            user.get('role') == 'requester'
-            and request_item
-            and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id')
-        )
-        if not (donor_report or requester_report):
-            return jsonify({'error': 'Only the requester or donor associated with this delivery can report an issue.'}), 403
+        if user.get('role') != 'requester' or not request_item or request_item.get('requester_id', request_item.get('ngo_id')) != user.get('id'):
+            return jsonify({'error': 'Only the receiver who owns this delivery can report an issue.'}), 403
         if task.get('status') != 'delivered':
             return jsonify({'error': 'An issue can only be reported after the delivery is completed.'}), 409
         payload = request.get_json(silent=True) or {}
         description = str(payload.get('description') or '').strip()
-        category = str(payload.get('category') or 'Other').strip()
-        additional_details = str(payload.get('additional_details') or '').strip()
         if not description:
             return jsonify({'error': 'Describe the delivery issue before submitting.'}), 400
-        if category not in {'Food quality', 'Packaging', 'Quantity', 'Delivery delay', 'Missing items', 'Other'}:
-            return jsonify({'error': 'Choose a valid delivery issue category.'}), 400
         if len(description) > 2000:
             return jsonify({'error': 'Issue description must be 2000 characters or fewer.'}), 400
-        if len(additional_details) > 2000:
-            return jsonify({'error': 'Additional issue details must be 2000 characters or fewer.'}), 400
 
         with DELIVERY_ISSUE_LOCK:
             data = load_data()
             task = next((item for item in data.get('delivery_tasks', []) if item.get('id') == task_id), None)
-            request_item = delivery_task_request(data, task) if task else None
-            donor_report = bool(
-                task
-                and user.get('role') == 'donor'
-                and delivery_task_owned_by_donor(data, task, user.get('id'))
-            )
-            requester_report = bool(
-                task
-                and user.get('role') == 'requester'
-                and request_item
-                and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id')
-            )
-            if not task or not (donor_report or requester_report):
+            request_item = next(
+                (item for item in data.get('donation_requests', []) if item.get('id') == task.get('request_id')),
+                None,
+            ) if task else None
+            if not task or not request_item or request_item.get('requester_id', request_item.get('ngo_id')) != user.get('id'):
                 return jsonify({'error': 'You are not authorized to report an issue for this delivery.'}), 403
             if task.get('status') != 'delivered':
                 return jsonify({'error': 'An issue can only be reported after the delivery is completed.'}), 409
             issues = data.setdefault('delivery_issues', [])
             if any(
-                item.get('task_id') == task_id and delivery_issue_reporter_id(item) == user.get('id')
+                (item.get('task_id') or item.get('delivery_id')) == task_id
+                and (item.get('reporter_id') or item.get('receiver_id')) == user.get('id')
                 for item in issues
             ):
                 return jsonify({'error': 'You have already reported an issue for this delivery.'}), 409
 
             created_at = utc_now()
             donation_id = delivery_task_donation_id(data, task)
-            issue_request_id = (
-                task.get('request_id')
-                or (request_item.get('id') if request_item else None)
-            )
             issue = {
                 'id': f'issue-{uuid.uuid4().hex[:10]}',
-                'reporter_id': user['id'],
-                'reporter_role': user.get('role'),
-                'donor_id': delivery_task_donor_id(data, task),
+                'request_id': request_item.get('id'),
                 'donation_id': donation_id,
-                'request_id': issue_request_id,
                 'delivery_id': task_id,
                 'task_id': task_id,
-                'ngo_id': task.get('ngo_id'),
-                'category': category,
+                'receiver_id': user['id'],
+                'reporter_id': user['id'],
+                'category': str(payload.get('category') or 'delivery').strip(),
                 'description': description,
-                'additional_details': additional_details,
                 'status': 'open',
-                'resolver_id': None,
+                'resolution_note': '',
                 'status_history': [{
                     'status': 'open',
                     'changed_by': user['id'],
@@ -3581,17 +4377,15 @@ def delivery_task_issues(task_id):
                 'created_at': created_at,
                 'updated_at': created_at,
             }
-            if user.get('role') == 'requester':
-                issue['receiver_id'] = user['id']
             issues.append(issue)
             notify_user(
                 data,
                 task.get('ngo_id'),
-                f'A delivery issue was reported for request {issue_request_id or "not linked"} (delivery {task_id}).',
+                f'A delivery issue was reported for request {request_item.get("id")} (delivery {task_id}).',
                 notification_type='delivery_issue',
             )
             save_data(data)
-        return jsonify({'issue': issue}), 201
+        return jsonify({'issue': serialize_delivery_issue(data, issue)}), 201
 
     if user.get('role') == 'volunteer':
         if task.get('volunteer_id') != user.get('id'):
@@ -3609,114 +4403,37 @@ def delivery_task_issues(task_id):
     elif user.get('role') == 'requester' and request_item and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id'):
         issues = [
             item for item in data.get('delivery_issues', [])
-            if item.get('task_id') == task_id and delivery_issue_reporter_id(item) == user.get('id')
+            if (item.get('task_id') or item.get('delivery_id')) == task_id
+            and (item.get('reporter_id') or item.get('receiver_id')) == user.get('id')
         ]
-    elif user.get('role') == 'donor' and delivery_task_owned_by_donor(data, task, user.get('id')):
+    elif user.get('role') == 'donor':
+        donation_id = delivery_task_donation_id(data, task)
+        donation = next(
+            (item for item in data.get('donations', []) if item.get('id') == donation_id),
+            None,
+        )
+        if not donation or donation.get('donor_id') != user.get('id'):
+            return jsonify({'error': 'You are not authorized to view issues for this delivery.'}), 403
         issues = [
             item for item in data.get('delivery_issues', [])
-            if item.get('task_id') == task_id and delivery_issue_reporter_id(item) == user.get('id')
+            if (item.get('task_id') or item.get('delivery_id')) == task_id
         ]
     else:
         return jsonify({'error': 'You are not authorized to view issues for this delivery.'}), 403
-    return jsonify({'issues': issues})
+    serialized_issues = [serialize_delivery_issue(data, issue) for issue in issues]
+    if user.get('role') == 'volunteer':
+        serialized_issues = [
+            {key: value for key, value in issue.items() if key not in {'receiver_id', 'reporter_id'}}
+            for issue in serialized_issues
+        ]
+    return jsonify({'issues': serialized_issues})
 
 
-@app.route('/api/donor/delivery-issues', methods=['GET'])
-def list_donor_delivery_issues():
-    user = current_user_from_auth()
-    if not user:
-        return jsonify({'error': 'Authentication required'}), 401
-    if user.get('role') != 'donor':
-        return jsonify({'error': 'Only donors can view donor delivery issues.'}), 403
-
-    data = load_data()
-    tasks_by_id = {
-        task.get('id'): task
-        for task in data.get('delivery_tasks', [])
-    }
-    requests_by_id = {
-        request_item.get('id'): request_item
-        for request_item in data.get('donation_requests', [])
-    }
-    donations_by_id = {
-        donation.get('id'): donation
-        for donation in data.get('donations', [])
-    }
-    own_issues = []
-    for issue in data.get('delivery_issues', []):
-        task = tasks_by_id.get(issue.get('task_id') or issue.get('delivery_id'))
-        request_item = (
-            delivery_task_request(data, task)
-            if task else requests_by_id.get(issue.get('request_id'))
-        )
-        donation_id = issue.get('donation_id') or (
-            delivery_task_donation_id(data, task) if task else None
-        ) or (request_item.get('donation_id') if request_item else None)
-        donation = donations_by_id.get(donation_id, {})
-        related_donor_id = (
-            (delivery_task_donor_id(data, task) if task else None)
-            or donation.get('donor_id')
-            or issue.get('donor_id')
-        )
-        if related_donor_id != user.get('id'):
-            continue
-        request_id = issue.get('request_id') or (request_item.get('id') if request_item else None)
-        issue_data = {
-            **issue,
-            'donor_id': related_donor_id,
-            'donation_id': donation_id,
-            'request_id': request_id,
-            'delivery_id': issue.get('delivery_id') or issue.get('task_id'),
-            'donation_name': donation.get('food_name', ''),
-            'request_name': requests_by_id.get(request_id, {}).get('food_name', ''),
-        }
-        own_issues.append(issue_data)
-
-    reportable_deliveries = []
-    reported_task_ids = {
-        issue.get('task_id') or issue.get('delivery_id')
-        for issue in own_issues
-    }
-    for task in data.get('delivery_tasks', []):
-        if (
-            task.get('status') != 'delivered'
-            or task.get('id') in reported_task_ids
-            or not delivery_task_owned_by_donor(data, task, user.get('id'))
-        ):
-            continue
-        donation_id = delivery_task_donation_id(data, task)
-        donation = donations_by_id.get(donation_id, {})
-        request_item = delivery_task_request(data, task) or {}
-        reportable_deliveries.append({
-            'id': task.get('id'),
-            'delivery_id': task.get('id'),
-            'request_id': request_item.get('id'),
-            'donation_id': donation_id,
-            'food_name': donation.get('food_name') or request_item.get('food_name', ''),
-            'category': donation.get('category', ''),
-        })
-
-    return jsonify({
-        'issues': sorted(own_issues, key=lambda issue: issue.get('created_at', '')),
-        'reportable_deliveries': reportable_deliveries,
-    })
-
-
-@app.route('/api/delivery-issues/<issue_id>', methods=['PATCH'])
+@app.route('/api/delivery-issues/<issue_id>', methods=['GET', 'PATCH'])
 def update_delivery_issue(issue_id):
     user = current_user_from_auth()
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
-    if user.get('role') != 'ngo':
-        return jsonify({'error': 'Only the coordinating NGO can update issue status.'}), 403
-
-    payload = request.get_json(silent=True) or {}
-    next_status = str(payload.get('status') or '').strip().casefold().replace(' ', '_')
-    if next_status not in {'open', 'under_review', 'resolved'}:
-        return jsonify({'error': 'Issue status must be Open, Under Review, or Resolved.'}), 400
-    requested_resolution_note = payload.get('resolution_note')
-    if requested_resolution_note is not None and len(str(requested_resolution_note).strip()) > 2000:
-        return jsonify({'error': 'Resolution notes must be 2000 characters or fewer.'}), 400
     data = load_data()
     issue = next(
         (item for item in data.get('delivery_issues', []) if item.get('id') == issue_id),
@@ -3724,63 +4441,96 @@ def update_delivery_issue(issue_id):
     )
     if not issue:
         return jsonify({'error': 'Delivery issue not found.'}), 404
-    task = next(
-        (
-            item for item in data.get('delivery_tasks', [])
-            if item.get('id') == (issue.get('task_id') or issue.get('delivery_id'))
-        ),
-        None,
-    )
+    task, request_item, donation = delivery_issue_context(data, issue)
+    if request.method == 'GET':
+        if not delivery_issue_visible_to_user(user, issue, task, request_item, donation):
+            return jsonify({'error': 'You are not authorized to view this delivery issue.'}), 403
+        return jsonify({'issue': serialize_delivery_issue(data, issue)})
+
+    if user.get('role') != 'ngo':
+        return jsonify({'error': 'Only the coordinating NGO can update issue status.'}), 403
+    payload = request.get_json(silent=True) or {}
+    next_status = str(payload.get('status') or '').strip().casefold().replace(' ', '_')
+    if next_status not in {'reported', 'open', 'under_review', 'resolved'}:
+        return jsonify({'error': 'Issue status must be Reported, Open, Under Review, or Resolved.'}), 400
     if not task or task.get('ngo_id') != user.get('id'):
         return jsonify({'error': 'You can only update issues for deliveries coordinated by your organization.'}), 403
 
-    current_status = issue.get('status', 'open')
-    allowed_next_status = {
+    current_status = issue.get('status', 'reported')
+    valid_next_status = {
+        'reported': {'reported', 'under_review'},
         'open': {'open', 'under_review'},
         'under_review': {'under_review', 'resolved'},
         'resolved': {'resolved'},
     }
-    if next_status not in allowed_next_status.get(current_status, set()):
-        return jsonify({
-            'error': 'Issue status must follow the Open -> Under Review -> Resolved lifecycle.',
-        }), 409
+    if next_status not in valid_next_status.get(current_status, set()):
+        return jsonify({'error': f'Issue cannot transition from {current_status} to {next_status}.'}), 409
 
-    resolution_note = str(
-        payload.get('resolution_note', issue.get('resolution_note', '')) or ''
-    ).strip()
-    status_changed = issue.get('status') != next_status
-    resolution_changed = issue.get('resolution_note', '') != resolution_note
-    if status_changed or resolution_changed:
-        issue['status'] = next_status
+    resolution_note = str(payload.get('resolution_note', issue.get('resolution_note', '')) or '').strip()
+    action_taken = issue.get('action_taken')
+    if 'action_taken' in payload:
+        if current_status != 'under_review' or next_status != 'under_review':
+            return jsonify({'error': 'Action taken can only be recorded while the issue is under review.'}), 409
+        if not isinstance(payload['action_taken'], bool):
+            return jsonify({'error': 'Action taken must be Yes or No.'}), 400
+        action_taken = payload['action_taken']
+        if action_taken and not resolution_note:
+            return jsonify({'error': 'Describe the action taken before saving it.'}), 400
+        if not action_taken:
+            resolution_note = ''
+    if next_status == 'resolved' and current_status != 'under_review':
+        return jsonify({'error': 'An issue must be under review before it can be resolved.'}), 409
+    if next_status == 'resolved' and (
+        issue.get('action_taken') is not True
+        or not str(issue.get('resolution_note') or '').strip()
+    ):
+        return jsonify({'error': 'Save Yes and describe the action taken before resolving this issue.'}), 409
+    if next_status == 'resolved' and not resolution_note:
+        return jsonify({'error': 'The saved action must remain recorded before resolving this issue.'}), 409
+    response_changed = resolution_note != str(issue.get('resolution_note') or '').strip()
+    action_changed = 'action_taken' in payload and issue.get('action_taken') is not action_taken
+    changed = (
+        current_status != next_status
+        or response_changed
+        or action_changed
+    )
+    if changed:
         issue['resolution_note'] = resolution_note
+        if 'action_taken' in payload:
+            issue['action_taken'] = action_taken
         issue['updated_at'] = utc_now()
-        issue['resolver_id'] = user['id']
-        if status_changed:
-            issue.setdefault('status_history', []).append({
+    if current_status != next_status:
+        issue['status'] = next_status
+        history = issue.setdefault('status_history', [])
+        if not history or history[-1].get('status') != next_status:
+            history.append({
                 'status': next_status,
                 'changed_by': user['id'],
                 'created_at': issue['updated_at'],
             })
         notify_user(
             data,
-            issue.get('receiver_id'),
-            (
-                f'Your delivery issue for delivery {task.get("id")} is now {next_status.replace("_", " ")}.'
-                if status_changed
-                else f'The NGO added a resolution update to your delivery issue for delivery {task.get("id")}.'
-            ),
+            issue.get('reporter_id') or issue.get('receiver_id'),
+            f'Your delivery issue for delivery {task.get("id")} is now {next_status.replace("_", " ")}.',
             notification_type='delivery_issue',
         )
+    elif response_changed or action_changed:
+        notify_user(
+            data,
+            issue.get('reporter_id') or issue.get('receiver_id'),
+            f'The NGO updated its action for your delivery issue for delivery {task.get("id")}.',
+            notification_type='delivery_issue',
+        )
+    if changed:
         save_data(data)
-    return jsonify({'issue': issue})
+    return jsonify({'issue': serialize_delivery_issue(data, issue)})
 
 
 @app.route('/api/community-needs', methods=['GET'])
 def list_needs():
     user = current_user_from_auth()
-    if not user:
-        return jsonify({'error': 'Authentication required'}), 401
-    if user['role'] == 'volunteer':
+    public_scope = not user or request.args.get('scope') == 'public_dashboard'
+    if user and user['role'] == 'volunteer' and not public_scope:
         return jsonify({'error': 'Community needs are not part of the volunteer delivery workflow.'}), 403
     data = load_data()
     contributions = data.get('community_need_contributions', [])
@@ -3793,6 +4543,53 @@ def list_needs():
         for task in need_tasks
         if task.get('community_contribution_id')
     }
+    if public_scope:
+        public_needs = []
+        for need in data.get('community_needs', []):
+            need_contributions = [
+                item for item in contributions if item.get('need_id') == need.get('id')
+            ]
+            delivered_quantity = sum(
+                float(item.get('quantity', 0) or 0)
+                for item in need_contributions
+                if item.get('status') == 'delivered'
+                or (task_by_contribution.get(item.get('id')) or {}).get('status') == 'delivered'
+            )
+            required_quantity = float(need.get('required_quantity', 0) or 0)
+            status = need.get('status', 'open')
+            if required_quantity > 0 and delivered_quantity >= required_quantity:
+                status = 'fulfilled'
+            elif status == 'fulfilled':
+                status = 'pending_delivery' if need_contributions else 'open'
+            if status not in {'open', 'partial', 'pending_delivery'}:
+                continue
+            public_needs.append({
+                'id': need.get('id'),
+                'category': need.get('category', ''),
+                'required_quantity': required_quantity,
+                'delivered_quantity': delivered_quantity,
+                'remaining_quantity': max(0, required_quantity - delivered_quantity),
+                'servings': need.get('servings', 0),
+                'location': need.get('location', ''),
+                'city': need.get('city', ''),
+                'urgency': need.get('urgency', ''),
+                'required_date': need.get('required_date', ''),
+                'description': need.get('description', ''),
+                'status': status,
+                'organization_name': next(
+                    (
+                        str(profile.get('organization_name') or '').strip()
+                        for profile in data.get('profiles', [])
+                        if profile.get('id') == need.get('ngo_id')
+                        and profile.get('role') == 'ngo'
+                    ),
+                    '',
+                ),
+                'created_at': need.get('created_at', ''),
+                'updated_at': need.get('updated_at', ''),
+            })
+        return jsonify({'needs': public_needs})
+
     corrected_legacy_status = False
     for need in data.get('community_needs', []):
         need_contributions = [item for item in contributions if item.get('need_id') == need.get('id')]
@@ -3916,6 +4713,195 @@ def create_need():
     })
     save_data(data)
     return jsonify({'need': need}), 201
+
+
+@app.route('/api/community-needs/<need_id>', methods=['PATCH', 'DELETE'])
+def update_community_need(need_id):
+    user = current_user_from_auth()
+    if not user or user.get('role') != 'ngo':
+        if request.method == 'DELETE':
+            return jsonify({'error': 'Only NGOs can delete community needs.'}), 403
+        return jsonify({'error': 'Only NGOs can update community needs.'}), 403
+
+    if request.method == 'DELETE':
+        data = load_data()
+        need = next(
+            (item for item in data.get('community_needs', []) if item.get('id') == need_id),
+            None,
+        )
+        if not need:
+            return jsonify({'error': 'Community need not found.'}), 404
+        if need.get('ngo_id') != user.get('id'):
+            return jsonify({'error': 'You can only delete your organization’s community needs.'}), 403
+
+        contribution_ids = {
+            item.get('id')
+            for item in data.get('community_need_contributions', [])
+            if item.get('need_id') == need_id and item.get('id')
+        }
+        request_ids = {
+            item.get('id')
+            for item in data.get('donation_requests', [])
+            if (
+                item.get('need_id') == need_id
+                or item.get('community_need_id') == need_id
+                or item.get('community_contribution_id') in contribution_ids
+            ) and item.get('id')
+        }
+        request_contribution_ids = {
+            item.get('id')
+            for item in data.get('request_contributions', [])
+            if (
+                item.get('need_id') == need_id
+                or item.get('community_need_id') == need_id
+                or item.get('community_contribution_id') in contribution_ids
+                or item.get('request_id') in request_ids
+            ) and item.get('id')
+        }
+        task_ids = {
+            item.get('id')
+            for item in data.get('delivery_tasks', [])
+            if (
+                item.get('community_need_id') == need_id
+                or item.get('community_contribution_id') in contribution_ids
+                or item.get('request_id') in request_ids
+                or item.get('request_contribution_id') in request_contribution_ids
+            ) and item.get('id')
+        }
+        feedback_ids = {
+            item.get('id')
+            for item in data.get('delivery_feedback', [])
+            if item.get('task_id') in task_ids and item.get('id')
+        }
+        issue_ids = {
+            item.get('id')
+            for item in data.get('delivery_issues', [])
+            if (item.get('task_id') or item.get('delivery_id')) in task_ids and item.get('id')
+        }
+
+        data['community_needs'] = [
+            item for item in data.get('community_needs', [])
+            if item.get('id') != need_id
+        ]
+        data['community_need_contributions'] = [
+            item for item in data.get('community_need_contributions', [])
+            if item.get('id') not in contribution_ids and item.get('need_id') != need_id
+        ]
+        data['donation_requests'] = [
+            item for item in data.get('donation_requests', [])
+            if (
+                item.get('id') not in request_ids
+                and item.get('need_id') != need_id
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+            )
+        ]
+        data['request_contributions'] = [
+            item for item in data.get('request_contributions', [])
+            if (
+                item.get('id') not in request_contribution_ids
+                and item.get('need_id') != need_id
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+                and item.get('request_id') not in request_ids
+            )
+        ]
+        data['delivery_tasks'] = [
+            item for item in data.get('delivery_tasks', [])
+            if (
+                item.get('id') not in task_ids
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+                and item.get('request_id') not in request_ids
+                and item.get('request_contribution_id') not in request_contribution_ids
+            )
+        ]
+        data['delivery_feedback'] = [
+            item for item in data.get('delivery_feedback', [])
+            if (
+                item.get('id') not in feedback_ids
+                and item.get('task_id') not in task_ids
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+            )
+        ]
+        data['delivery_issues'] = [
+            item for item in data.get('delivery_issues', [])
+            if (
+                item.get('id') not in issue_ids
+                and item.get('task_id') not in task_ids
+                and item.get('delivery_id') not in task_ids
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+            )
+        ]
+        data['distribution_records'] = [
+            item for item in data.get('distribution_records', [])
+            if (
+                item.get('task_id') not in task_ids
+                and item.get('delivery_task_id') not in task_ids
+                and item.get('need_id') != need_id
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+                and item.get('request_id') not in request_ids
+                and item.get('request_contribution_id') not in request_contribution_ids
+            )
+        ]
+        data['notifications'] = [
+            item for item in data.get('notifications', [])
+            if (
+                item.get('need_id') != need_id
+                and item.get('community_need_id') != need_id
+                and item.get('community_contribution_id') not in contribution_ids
+                and item.get('request_id') not in request_ids
+                and item.get('request_contribution_id') not in request_contribution_ids
+                and item.get('task_id') not in task_ids
+                and item.get('delivery_task_id') not in task_ids
+                and item.get('feedback_id') not in feedback_ids
+                and item.get('issue_id') not in issue_ids
+            )
+        ]
+        save_data(data)
+        return jsonify({'success': True, 'deleted_id': need_id})
+
+    payload = request.get_json(silent=True) or {}
+    required = ('category', 'required_quantity', 'location', 'urgency', 'required_date', 'description')
+    missing = [field for field in required if not payload.get(field)]
+    if missing:
+        return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
+    try:
+        required_quantity = float(payload['required_quantity'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Required quantity must be a positive number.'}), 400
+    if not math.isfinite(required_quantity) or required_quantity <= 0:
+        return jsonify({'error': 'Required quantity must be a positive number.'}), 400
+
+    data = load_data()
+    need = next(
+        (item for item in data.get('community_needs', []) if item.get('id') == need_id),
+        None,
+    )
+    if not need:
+        return jsonify({'error': 'Community need not found.'}), 404
+    if need.get('ngo_id') != user.get('id'):
+        return jsonify({'error': 'You can only update your organization’s community needs.'}), 403
+
+    previous_quantity = float(need.get('required_quantity', 0) or 0)
+    need.update({
+        'category': str(payload['category']).strip(),
+        'required_quantity': required_quantity,
+        'location': str(payload['location']).strip(),
+        'city': str(payload.get('city') or '').strip(),
+        'urgency': str(payload['urgency']).strip(),
+        'required_date': str(payload['required_date']).strip(),
+        'description': str(payload['description']).strip(),
+        'updated_at': utc_now(),
+    })
+    if float(need.get('servings', previous_quantity) or 0) == previous_quantity:
+        need['servings'] = int(required_quantity)
+
+    save_data(data)
+    return jsonify({'need': need})
 
 
 @app.route('/api/community-needs/<need_id>/respond', methods=['POST', 'PATCH'])
@@ -4062,6 +5048,9 @@ def assign_community_need_delivery(need_id):
         return jsonify({'error': 'Community need not found.'}), 404
     if need.get('ngo_id') != user['id']:
         return jsonify({'error': 'You can only assign deliveries for your organization’s community needs.'}), 403
+    need_deadline = task_deadline_datetime(need.get('required_date'), date_only_is_end_of_day=True)
+    if need_deadline is not None and need_deadline <= datetime.now().astimezone():
+        return jsonify({'error': 'The community need deadline has passed; a delivery task cannot be assigned.'}), 409
 
     contribution = next(
         (
@@ -4290,7 +5279,10 @@ def ai_match():
             app.logger.warning('Gemini request failed: %s', str(exc))
 
     data = load_data()
-    donation = next((d for d in data['donations'] if d['status'] in {'available', 'requested'}), None)
+    donation = next(
+        (item for item in data.get('donations', []) if donation_is_requestable(data, item)),
+        None,
+    )
     need = next((n for n in data['community_needs'] if n['status'] == 'open'), None)
     if donation and need:
         return jsonify({'match': {'title': 'Suggested match', 'reason': f'{donation["food_name"]} in {donation["city"]} fits the urgent {need["category"]} request in {need["location"]}.', 'confidence': 'Medium'}})

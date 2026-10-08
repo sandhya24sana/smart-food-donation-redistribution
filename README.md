@@ -52,14 +52,13 @@ cd frontend
 npm install
 ```
 
-The Flask backend stores application records in `backend/data/app_data.json`; a fresh local installation starts with an empty data store. No sample accounts or demo records are seeded automatically. The existing recovered records are retained in the current store. In local demo mode users can sign in without registration; registration remains available for persistent accounts. No API key or environment file is required.
+The Flask backend stores application records in `backend/data/app_data.json`; a fresh local installation starts with an empty data store. No sample accounts, demo records, or demo credentials are seeded automatically. Create an account through the existing Sign Up flow before logging in. No API key or environment file is required.
 
 ## Run the app
 
-Start the backend server in local demonstration mode (Windows PowerShell):
+Start the backend server (Windows PowerShell):
 
 ```powershell
-$env:APP_ENV = "development"
 python backend/app.py
 ```
 
@@ -74,7 +73,9 @@ Open: http://localhost:5173
 
 ## Account registration
 
-Select Donor, Receiver, NGO / Organization, or Volunteer on the first page, choose **Continue**, and enter any non-empty email and password. The selected role is carried to login, so there is no second role-selection step. With `APP_ENV=development`, the Flask API on port 5001 accepts demonstration credentials and creates a persistent role profile and session. The four dashboards use the same saved donation, request, delivery, contribution, notification, feedback, and certificate records. Demo authentication accepts arbitrary credentials, so do not expose this demonstration backend as a production authentication service.
+Select Donor, Receiver, NGO / Organization, or Volunteer on the first page, choose **Continue**, and create an account with a new email and password. The selected role is carried to login, so there is no second role-selection step. Sign Up stores the account and immediately creates a session; subsequent logins require the same email, password, and role. The four dashboards use the same saved donation, request, delivery, contribution, notification, feedback, and certificate records.
+
+Public browsing is available without signing in at `/home`, `/browse`, and `/dashboard`. These views expose active food listing details and active community needs, while donation images are served through the existing public uploads route. Anonymous API responses omit donor contact and ownership data. Creating or changing records, responding to food, viewing personal dashboards, and other user-specific operations still require authentication; action links return to the requested dashboard after login.
 
 ## Database schema
 
@@ -82,7 +83,7 @@ Select Donor, Receiver, NGO / Organization, or Volunteer on the first page, choo
 
 ## Food image matching
 
-Food-name fallbacks use the licensed photographs stored under `frontend/public/food-images`; the image mapping works locally without image-search APIs or AI generation. Donor-uploaded photos take priority over category matches, and unsupported foods show a neutral placeholder.
+When a donor enters a food name, the Donate Food form requests a matching image through Flask's `/api/food-image?food_name=...` endpoint using that exact name plus `food`, then retries with `drink`, `beverage`, or a glass-of-item query when needed. The backend searches Wikimedia Commons, ranks only exact-name title matches, and rejects generic artwork, preparation, packaging, and venue results. Lookups are debounced and successful results are cached to avoid repeated provider requests. If no exact result is available, the existing placeholder is shown; donation creation and editing still work with an empty image URL. Donor-uploaded photos remain the highest priority. Wikimedia Commons requires no API key.
 
 Donor-uploaded food photos are saved by the Flask backend in `backend/uploads` (or the directory configured by `UPLOAD_FOLDER`). Relative `UPLOAD_FOLDER` values are resolved from the project root so the same saved files are served after restarting the backend from a different working directory. The donation record stores the returned `/uploads/...` path, allowing its photo to remain available when the donation is edited or viewed again.
 
@@ -94,7 +95,6 @@ Delivery issues are stored once in the `delivery_issues` collection and remain l
 
 ## Notes
 
-- Food-name image fallbacks use locally stored photographs; no external image-generation service or API key is used.
-- Demo login accepts arbitrary non-empty credentials; do not expose it as a production authentication service.
+- Donate Food image lookup uses Wikimedia Commons and requires no API key.
 - Fresh local installs start with an empty data store; local file uploads are used when cloud storage is not configured.
 - The database schema is included as a reference for a future PostgreSQL migration.

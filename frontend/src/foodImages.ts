@@ -21,6 +21,7 @@ const LOCAL_FOOD_IMAGES: Array<[RegExp, string]> = [
 ]
 
 const LOCAL_FOOD_CATEGORY_IMAGES: Array<[RegExp, string]> = [
+  [/\bmeals?\b/, '/food-images/rice-meals.jpg'],
   [/\bsouth[\s-]?indian\b|\btiffin\b/, '/food-images/south-indian.jpg'],
   [/\bsnacks?\b|\bstreet[\s-]?food\b/, '/food-images/snacks.jpg'],
   [/\bfruit\b|\bfruits\b/, '/food-images/fruits.jpg'],

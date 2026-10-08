@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { BrowserRouter, Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import {
   ArrowRight,
@@ -63,48 +63,10 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { getLocalFoodFallbackImage } from './foodImages'
 
 type Role = 'donor' | 'requester' | 'volunteer' | 'ngo' | 'admin'
 type UserRole = Exclude<Role, 'admin'>
-
-function loginUrl(role?: UserRole, next?: string): string {
-  const params = new URLSearchParams({ mode: 'login' })
-  if (role) params.set('role', role)
-  if (next) params.set('next', next)
-  return `/auth?${params.toString()}`
-}
-
-function safeNextPath(value: string | null): string | null {
-  if (!value || !value.startsWith('/') || value.startsWith('//')) return null
-  try {
-    const target = new URL(value, window.location.origin)
-    return target.origin === window.location.origin && target.pathname !== '/auth'
-      ? `${target.pathname}${target.search}${target.hash}`
-      : null
-  } catch {
-    return null
-  }
-}
-
-function AuthenticationRequired({ user, authReady = true, children }: {
-  user: SessionUser | null
-  authReady?: boolean
-  children: React.ReactNode
-}) {
-  const location = useLocation()
-  if (!authReady) {
-    return <main className="p-8 text-center text-sm text-slate-600" role="status">Checking your session…</main>
-  }
-  if (user) return children
-
-  const dashboardRole = location.pathname.match(/^\/dashboard\/(donor|requester|volunteer|ngo|admin)(?:\/|$)/)?.[1]
-  const role: UserRole | undefined = dashboardRole && isUserRole(dashboardRole)
-    ? dashboardRole
-    : location.pathname.startsWith('/delivery-feedback/')
-      ? 'requester'
-      : undefined
-  return <Navigate to={loginUrl(role, `${location.pathname}${location.search}${location.hash}`)} replace />
-}
 
 function isUserRole(value: string | null): value is UserRole {
   return value === 'donor' || value === 'requester' || value === 'volunteer' || value === 'ngo'
@@ -115,7 +77,6 @@ function isDashboardRole(value: string | undefined): value is Role {
 }
 
 function DeliveryFeedbackPage({ user }: { user: SessionUser }) {
-  const navigate = useNavigate()
   const { taskId = '' } = useParams()
   const [task, setTask] = useState<DeliveryTask | null>(null)
   const [feedback, setFeedback] = useState<FeedbackEntry | null>(null)
@@ -205,11 +166,10 @@ function DeliveryFeedbackPage({ user }: { user: SessionUser }) {
     try {
       const response = await apiRequest(`/delivery-tasks/${encodeURIComponent(taskId)}/issues`, {
         method: 'POST',
-        body: JSON.stringify({ category: 'delivery', description: issueDescription }),
+        body: JSON.stringify({ description: issueDescription }),
       })
-      setIssues((current) => current.some((issue) => issue.id === response.issue.id) ? current : [...current, response.issue])
+      setIssues((current) => [...current, response.issue])
       setMessage('Your delivery issue was reported.')
-      navigate(`/delivery-issues/${encodeURIComponent(response.issue.id)}`)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to report delivery issue')
     } finally {
@@ -218,13 +178,13 @@ function DeliveryFeedbackPage({ user }: { user: SessionUser }) {
   }
 
   if (!canSubmit) {
-    return <main className="mx-auto max-w-2xl p-6"><section className="section-shell rounded-[28px] p-6"><h1 className="text-2xl font-bold text-slate-900">Feedback unavailable</h1><p className="mt-2 text-sm text-slate-600">Only the receiver who owns a delivered request can submit feedback.</p><Link to={`/dashboard/${user.role}`} className="primary-btn mt-4 inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold"><ArrowRight size={16} />Return to dashboard</Link></section></main>
+    return <main className="mx-auto max-w-2xl p-6"><section className="section-shell rounded-[28px] p-6"><h1 className="text-2xl font-bold text-slate-900">Feedback unavailable</h1><p className="mt-2 text-sm text-slate-600">Only the receiver who owns a delivered request can submit feedback.</p><Link to="/dashboard" className="primary-btn mt-4 inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold"><ArrowRight size={16} />Return to dashboard</Link></section></main>
   }
 
   return (
     <main className="mx-auto max-w-2xl p-6">
       <section className="section-shell rounded-[28px] p-6">
-        <Link to={`/dashboard/${user.role}`} className="inline-flex items-center gap-1 text-sm font-semibold text-[#1d4d3d] underline"><ArrowRight className="rotate-180" size={14} />Return to dashboard</Link>
+        <Link to="/dashboard" className="inline-flex items-center gap-1 text-sm font-semibold text-[#1d4d3d] underline"><ArrowRight className="rotate-180" size={14} />Return to dashboard</Link>
         <h1 className="mt-4 text-3xl font-black text-slate-900">Delivery feedback</h1>
         {loading ? <p className="mt-4 text-sm text-slate-600">Loading delivery…</p> : task ? (
           <>
@@ -283,140 +243,6 @@ function DeliveryFeedbackPage({ user }: { user: SessionUser }) {
   )
 }
 
-function DeliveryIssuePage({ user }: { user: SessionUser }) {
-  const { issueId = '' } = useParams()
-  const [issue, setIssue] = useState<DeliveryIssue | null>(null)
-  const [status, setStatus] = useState<DeliveryIssue['status']>('open')
-  const [resolutionNote, setResolutionNote] = useState('')
-  const [actionTaken, setActionTaken] = useState<'' | 'yes' | 'no'>('')
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [message, setMessage] = useState('')
-  const canResolve = user.role === 'ngo'
-
-  const loadIssue = useCallback(async () => {
-    try {
-      const response = await apiRequest(`/delivery-issues/${encodeURIComponent(issueId)}`)
-      setIssue(response.issue)
-      setStatus(response.issue.status)
-      setResolutionNote(response.issue.resolution_note || '')
-      setActionTaken(response.issue.action_taken === true ? 'yes' : response.issue.action_taken === false ? 'no' : '')
-      setMessage('')
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to load delivery issue.')
-    } finally {
-      setLoading(false)
-    }
-  }, [issueId])
-
-  useEffect(() => {
-    void loadIssue()
-  }, [loadIssue])
-
-  const saveIssue = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!issue || !canResolve) return
-    setSaving(true)
-    setMessage('')
-    try {
-      const response = await apiRequest(`/delivery-issues/${encodeURIComponent(issue.id)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          status,
-          resolution_note: resolutionNote,
-          ...(status === 'under_review' && actionTaken ? { action_taken: actionTaken === 'yes' } : {}),
-        }),
-      })
-      setIssue(response.issue)
-      setStatus(response.issue.status)
-      setResolutionNote(response.issue.resolution_note || '')
-      setActionTaken(response.issue.action_taken === true ? 'yes' : response.issue.action_taken === false ? 'no' : '')
-      setMessage('Issue update saved.')
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to update delivery issue.')
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <main className="mx-auto max-w-3xl p-4 sm:p-6">
-      <section className="section-shell rounded-[28px] p-6">
-        <Link to={`/dashboard/${user.role}`} className="inline-flex items-center gap-1 text-sm font-semibold text-[#1d4d3d] underline"><ArrowRight className="rotate-180" size={14} />Return to dashboard</Link>
-        <h1 className="mt-4 text-3xl font-black text-slate-900">Delivery issue</h1>
-        {loading ? <p role="status" className="mt-4 text-sm text-slate-600">Loading issue…</p> : issue ? (
-          <>
-            <p className="mt-2 text-xs text-slate-500">Issue ID: {issue.id}</p>
-            <div className="mt-5 grid gap-3 rounded-2xl bg-slate-50 p-4 text-sm sm:grid-cols-2">
-              <p><span className="font-semibold">Category:</span> {issue.category || 'Delivery'}</p>
-              <p><span className="font-semibold">Status:</span> {formatStatus(issue.status)}</p>
-              <p><span className="font-semibold">Reporter:</span> {issue.reporter_id || issue.receiver_id || 'Not recorded'}</p>
-              <p><span className="font-semibold">Reported:</span> {new Date(issue.created_at).toLocaleString()}</p>
-              <p><span className="font-semibold">Delivery:</span> {issue.delivery_id || issue.task_id}</p>
-              <p><span className="font-semibold">Request:</span> {issue.request_id || 'Not linked'}</p>
-              <p className="sm:col-span-2"><span className="font-semibold">Donation:</span> {issue.donation_id || 'Not linked'}</p>
-            </div>
-            <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50/50 p-4">
-              <h2 className="font-semibold text-slate-900">Issue description</h2>
-              <p className="mt-2 whitespace-pre-wrap text-sm text-slate-700">{issue.description}</p>
-            </div>
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
-              <h2 className="font-semibold text-slate-900">NGO response</h2>
-              <p className="mt-2 whitespace-pre-wrap text-sm text-slate-700">{issue.resolution_note || 'The NGO has not responded yet.'}</p>
-            </div>
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
-              <h2 className="font-semibold text-slate-900">Status history</h2>
-              <ol className="mt-3 space-y-2 text-sm text-slate-600">
-                {(issue.status_history || []).map((entry, index) => (
-                  <li key={`${entry.status}-${entry.created_at}-${index}`}>{formatStatus(entry.status)} · {new Date(entry.created_at).toLocaleString()}</li>
-                ))}
-              </ol>
-            </div>
-            {canResolve && issue.status !== 'resolved' && (
-              <form onSubmit={saveIssue} className="mt-5 space-y-3 rounded-2xl border border-slate-200 bg-white p-4">
-                <label className="block text-sm font-semibold text-slate-700">Update status
-                  <select value={status} onChange={(event) => setStatus(event.target.value as DeliveryIssue['status'])} className="input-shell mt-1">
-                    <option value={issue.status}>{formatStatus(issue.status)}</option>
-                    {issue.status === 'reported' && <option value="under_review">Under Review</option>}
-                    {issue.status === 'open' && <option value="under_review">Under Review</option>}
-                    {issue.status === 'under_review' && issue.action_taken === true && actionTaken !== 'no' && resolutionNote.trim() && <option value="resolved">Resolved</option>}
-                  </select>
-                </label>
-                {issue.status === 'under_review' && status === 'under_review' && (
-                  <>
-                    <label className="block text-sm font-semibold text-slate-700">Was any action taken?
-                      <select value={actionTaken || (issue.action_taken === true ? 'yes' : issue.action_taken === false ? 'no' : '')} onChange={(event) => {
-                        const selection = event.target.value as '' | 'yes' | 'no'
-                        setActionTaken(selection)
-                        if (selection === 'no') setStatus('under_review')
-                      }} className="input-shell mt-1">
-                        <option value="">Select Yes or No</option>
-                        <option value="yes">Yes</option>
-                        <option value="no">No</option>
-                      </select>
-                    </label>
-                    {actionTaken === 'yes' && (
-                      <label className="block text-sm font-semibold text-slate-700">What action was taken?
-                        <textarea value={resolutionNote} onChange={(event) => setResolutionNote(event.target.value)} maxLength={2000} className="input-shell mt-1 min-h-24" />
-                      </label>
-                    )}
-                  </>
-                )}
-                <button type="submit" disabled={saving || (status === 'resolved' && (issue.action_taken !== true || !issue.resolution_note?.trim())) || (status === 'under_review' && actionTaken === 'yes' && !resolutionNote.trim()) || (status === issue.status && resolutionNote === (issue.resolution_note || '') && (!actionTaken || (actionTaken === 'yes') === issue.action_taken))} className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold disabled:opacity-60">
-                  {saving ? <LoaderCircle className="animate-spin" size={15} /> : <Save size={15} />}{saving ? 'Saving…' : status === 'under_review' && actionTaken ? 'Save action' : 'Save issue update'}
-                </button>
-              </form>
-            )}
-          </>
-        ) : (
-          <p role="alert" className="mt-4 rounded-xl bg-amber-50 p-3 text-sm text-amber-900">{message || 'Delivery issue not found.'}</p>
-        )}
-        {message && issue && <p role="status" className="mt-4 rounded-xl bg-slate-50 p-3 text-sm text-slate-700">{message}</p>}
-      </section>
-    </main>
-  )
-}
-
 function DeliveryFeedbackDialog({
   taskId,
   initialMode,
@@ -428,7 +254,6 @@ function DeliveryFeedbackDialog({
   onClose: () => void
   onSubmitted: () => Promise<void>
 }) {
-  const navigate = useNavigate()
   const [mode, setMode] = useState<'feedback' | 'issue'>(initialMode)
   const [feedback, setFeedback] = useState<FeedbackEntry | null>(null)
   const [issues, setIssues] = useState<DeliveryIssue[]>([])
@@ -439,7 +264,6 @@ function DeliveryFeedbackDialog({
   const [appreciation, setAppreciation] = useState('Thank you for making this delivery possible.')
   const [editing, setEditing] = useState(false)
   const [issueDescription, setIssueDescription] = useState('')
-  const [issueCategory, setIssueCategory] = useState('delivery')
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -496,13 +320,10 @@ function DeliveryFeedbackDialog({
       } else {
         const response = await apiRequest(`/delivery-tasks/${encodeURIComponent(taskId)}/issues`, {
           method: 'POST',
-          body: JSON.stringify({ category: issueCategory, description: issueDescription }),
+          body: JSON.stringify({ description: issueDescription }),
         })
-        setIssues((current) => current.some((issue) => issue.id === response.issue.id) ? current : [...current, response.issue])
+        setIssues((current) => [...current, response.issue])
         setMessage('Your delivery issue was reported to the coordinating organization.')
-        await onSubmitted()
-        navigate(`/delivery-issues/${encodeURIComponent(response.issue.id)}`)
-        return
       }
       await onSubmitted()
     } catch (error) {
@@ -573,14 +394,6 @@ function DeliveryFeedbackDialog({
           </div>
         ) : (
           <form onSubmit={submit} className="mt-5 space-y-3">
-            <label className="block text-sm font-semibold text-slate-700">Issue category
-              <select value={issueCategory} onChange={(event) => setIssueCategory(event.target.value)} className="input-shell mt-1">
-                <option value="delivery">Delivery</option>
-                <option value="food_quality">Food quality</option>
-                <option value="quantity">Quantity</option>
-                <option value="other">Other</option>
-              </select>
-            </label>
             <label className="block text-sm font-semibold text-slate-700">Describe the issue
               <textarea value={issueDescription} onChange={(event) => setIssueDescription(event.target.value)} className="input-shell mt-1 min-h-28" maxLength={2000} required />
             </label>
@@ -636,97 +449,15 @@ type Donation = {
   cancellation_eligible?: boolean
 }
 
-type PublicDonation = {
-  id: string
-  food_name: string
-  category: string
-  description?: string
-  quantity: number
-  available_quantity: number
-  distributed_quantity?: number
-  remaining_quantity?: number
-  quantity_unit: string
-  servings: number
-  status: string
-  is_requestable?: boolean
-  city: string
-  image_url?: string
-  image_source?: string
-  is_veg?: boolean
-  preparation_time?: string
-  available_until?: string
-  pickup_available_until?: string
-  created_at?: string
-  status_history?: Array<{ status: string; created_at: string }>
-}
-
-type PublicDonationSummary = Omit<PublicDonation, 'status_history'>
-
-function publicDonationSummary(donation: PublicDonation): PublicDonationSummary {
-  const { status_history: _statusHistory, ...summary } = donation
-  return summary
-}
-
-type PublicDashboardOverview = {
-  stats: {
-    total_donations: number
-    available_donations: number
-    meals_redistributed: number
-    fulfilled_requests: number
-    connected_organizations: number
-    completed_donations: number
-    active_donations: number
-    meals_redistributed_before_expiry: number
-    open_volunteer_opportunities: number
-  }
-  organizations: Array<{
-    organization_name: string
-    city: string
-  }>
-  matches: Array<{
-    donation_id: string
-    food_name: string
-    category: string
-    city: string
-    available_quantity: number
-    quantity_unit: string
-    need_id: string
-    need_remaining_quantity: number
-    organization_name: string
-  }>
-  volunteers: Array<{
-    id: string
-    full_name: string
-    city: string
-    status: string
-  }>
-  volunteer_opportunities: Array<{
-    category: string
-    city: string
-    created_at: string
-  }>
-  community_needs: PublicCommunityNeed[]
-  alerts: Array<{
-    type: string
-    message: string
-    created_at: string
-  }>
-}
-
 type DeliveryIssue = {
   id: string
-  request_id?: string | null
-  donation_id?: string | null
-  delivery_id?: string | null
-  task_id?: string | null
-  reporter_id?: string | null
+  request_id: string
+  delivery_id: string
+  task_id: string
   receiver_id?: string
-  category?: string
   description: string
-  status: 'reported' | 'open' | 'under_review' | 'resolved'
-  action_taken?: boolean
-  resolution_note?: string
-  status_history?: Array<{ status: string; changed_by?: string; created_at: string }>
+  status: 'open' | 'under_review' | 'resolved'
+  status_history?: Array<{ status: string; created_at: string }>
   created_at: string
   updated_at: string
 }
@@ -932,24 +663,6 @@ type CommunityNeed = {
   delivered_quantity?: number
   created_at: string
   updated_at: string
-}
-
-type PublicCommunityNeed = {
-  id: string
-  category: string
-  required_quantity: number
-  delivered_quantity?: number
-  remaining_quantity?: number
-  servings: number
-  location: string
-  city: string
-  urgency: string
-  required_date: string
-  description: string
-  status: string
-  organization_name?: string
-  created_at?: string
-  updated_at?: string
 }
 
 type CommunityNeedContribution = {
@@ -1571,106 +1284,8 @@ async function createCertificatePdf(svgMarkup: string): Promise<Blob> {
   return new Blob([pdfBuffer], { type: 'application/pdf' })
 }
 
-const configuredApiBase = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, '')
-const API_BASE = configuredApiBase
-  ? (/\/api$/i.test(configuredApiBase) ? configuredApiBase : `${configuredApiBase}/api`)
-  : '/api'
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5001/api'
 const MAX_IMAGE_UPLOAD_BYTES = 16 * 1024 * 1024
-
-async function requestCertificateDownload(certificateId: string, pdf: Blob): Promise<void> {
-  const token = localStorage.getItem('smart_food_token')
-  const headers = new Headers()
-  if (token) headers.set('Authorization', `Bearer ${token}`)
-  const formData = new FormData()
-  formData.append('certificate_id', certificateId)
-  formData.append('certificate_pdf', pdf, `${certificateId}.pdf`)
-
-  let response: Response
-  try {
-    response = await fetch(`${API_BASE}/certificates/download`, {
-      method: 'POST',
-      headers,
-      body: formData,
-    })
-  } catch (error) {
-    const reason = error instanceof Error ? ` ${error.message}` : ''
-    throw new Error(`Could not reach the backend to download the certificate.${reason}`)
-  }
-
-  if (!response.ok) {
-    const responseText = await response.text()
-    let message = `Certificate download failed (HTTP ${response.status}).`
-    if (responseText) {
-      try {
-        const body: { error?: string } = JSON.parse(responseText)
-        message = body.error || message
-      } catch {
-        message = `Certificate download failed with an unreadable response (HTTP ${response.status}).`
-      }
-    }
-    throw new Error(message)
-  }
-
-  const downloadedPdf = await response.blob()
-  if (downloadedPdf.type !== 'application/pdf') {
-    throw new Error('The backend did not return a PDF certificate.')
-  }
-  const url = URL.createObjectURL(downloadedPdf)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = `${certificateId}.pdf`
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-
-async function requestVolunteerCertificateDownload(
-  certificate: { certificate_id: string; recipient_name: string; completed_deliveries: number; issue_date: string },
-): Promise<void> {
-  const token = localStorage.getItem('smart_food_token')
-  const headers = new Headers({ 'Content-Type': 'application/json' })
-  if (token) headers.set('Authorization', `Bearer ${token}`)
-
-  let response: Response
-  try {
-    response = await fetch(`${API_BASE}/certificates/download`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(certificate),
-    })
-  } catch (error) {
-    const reason = error instanceof Error ? ` ${error.message}` : ''
-    throw new Error(`Could not reach the backend to download the certificate.${reason}`)
-  }
-
-  if (!response.ok) {
-    const responseText = await response.text()
-    let message = `Certificate download failed (HTTP ${response.status}).`
-    if (responseText) {
-      try {
-        const body: { error?: string } = JSON.parse(responseText)
-        message = body.error || message
-      } catch {
-        message = `Certificate download failed with an unreadable response (HTTP ${response.status}).`
-      }
-    }
-    throw new Error(message)
-  }
-
-  const downloadedPdf = await response.blob()
-  if (downloadedPdf.type !== 'application/pdf') {
-    throw new Error('The backend did not return a PDF certificate.')
-  }
-  const url = URL.createObjectURL(downloadedPdf)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = `${certificate.certificate_id}.pdf`
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
 
 function isDonorUploadedImage(donation: Pick<Donation, 'image_url' | 'image_source'>): boolean {
   return donation.image_source === 'uploaded'
@@ -1680,84 +1295,31 @@ function isDonorUploadedImage(donation: Pick<Donation, 'image_url' | 'image_sour
 }
 
 function getDonationImage(donation: FoodImageData): string {
-  if (donation.image_url) {
+  if (isDonorUploadedImage(donation) && donation.image_url) {
     if (donation.image_url.startsWith('/uploads/')) {
       return `${API_BASE.replace('/api', '')}${donation.image_url}`
     }
     return donation.image_url
   }
-  return ''
-}
-
-const foodImageSearchCache = new Map<string, Promise<string | null>>()
-
-function isFoodProviderImageUrl(value: unknown): value is string {
-  if (typeof value !== 'string') return false
-  try {
-    const imageUrl = new URL(value)
-    return imageUrl.protocol === 'https:'
-      && ['upload.wikimedia.org', 'thumb.wikimedia.org'].includes(imageUrl.hostname)
-  } catch {
-    return false
-  }
-}
-
-function searchFoodImage(foodName: string): Promise<string | null> {
-  const normalizedName = foodName.trim().toLocaleLowerCase()
-  if (!normalizedName) return Promise.resolve(null)
-
-  const cachedResult = foodImageSearchCache.get(normalizedName)
-  if (cachedResult) return cachedResult
-
-  const result = apiRequest(`/food-image?food_name=${encodeURIComponent(foodName.trim())}`)
-    .then((response) => isFoodProviderImageUrl(response.image_url) ? response.image_url : null)
-    .catch(() => null)
-    .then((imageUrl) => {
-      if (!imageUrl) foodImageSearchCache.delete(normalizedName)
-      return imageUrl
-    })
-  foodImageSearchCache.set(normalizedName, result)
-  return result
+  return getLocalFoodFallbackImage(donation.food_name || '', donation.category)
 }
 
 function DonationImage({ donation, className }: { donation: FoodImageData; className: string }) {
-  const foodName = donation.food_name || ''
-  const isDonorUpload = isDonorUploadedImage(donation)
-  const storedImage = getDonationImage(donation)
-  const [searchedImage, setSearchedImage] = useState<{ foodName: string; imageUrl: string | null }>({ foodName: '', imageUrl: null })
+  const imageSource = getDonationImage(donation)
   const [failedImageSource, setFailedImageSource] = useState('')
-  useEffect(() => {
-    let active = true
-    if (isDonorUpload || storedImage || !foodName.trim()) {
-      setSearchedImage({ foodName, imageUrl: null })
-      return () => { active = false }
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      void searchFoodImage(foodName).then((imageUrl) => {
-        if (active) setSearchedImage({ foodName, imageUrl })
-      })
-    }, 400)
-    return () => {
-      active = false
-      window.clearTimeout(timeoutId)
-    }
-  }, [foodName, isDonorUpload, storedImage])
-
-  const imageSource = isDonorUpload
-    ? storedImage
-    : searchedImage.foodName === foodName
-      ? searchedImage.imageUrl || storedImage
-      : storedImage
+  const isDonorUpload = isDonorUploadedImage(donation)
+  const fallbackImage = isDonorUpload ? '' : getLocalFoodFallbackImage(donation.food_name || '', donation.category)
   const displayedImage = imageSource && failedImageSource !== imageSource
     ? imageSource
-    : ''
+    : fallbackImage && failedImageSource !== fallbackImage
+      ? fallbackImage
+      : ''
 
   return displayedImage ? (
     <span className={`relative inline-flex overflow-hidden ${className.replace(/\bobject-cover\b/g, '')}`}>
       <img
         src={displayedImage}
-        alt={foodName || 'Food donation'}
+        alt={donation.food_name || 'Food donation'}
         className="h-full w-full object-cover"
         onError={() => setFailedImageSource(displayedImage)}
       />
@@ -1768,7 +1330,7 @@ function DonationImage({ donation, className }: { donation: FoodImageData; class
       )}
     </span>
   ) : (
-    <div className={`${className} flex items-center justify-center bg-white px-2 text-center text-xs text-slate-500`} role="img" aria-label={`${foodName}: Food image unavailable`}>
+    <div className={`${className} flex items-center justify-center bg-white px-2 text-center text-xs text-slate-500`} role="img" aria-label={`${donation.food_name}: Food image unavailable`}>
       Food image unavailable
     </div>
   )
@@ -1776,105 +1338,6 @@ function DonationImage({ donation, className }: { donation: FoodImageData; class
 
 function formatStatus(value: string): string {
   return (value || 'pending').replace(/_/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase())
-}
-
-function statusToneClass(value: string): string {
-  switch ((value || 'pending').toLowerCase()) {
-    case 'expired':
-    case 'cancelled':
-    case 'rejected':
-      return 'bg-red-100 text-red-800'
-    case 'completed':
-    case 'fulfilled':
-    case 'delivered':
-      return 'bg-green-100 text-green-800'
-    case 'available':
-    case 'accepted':
-    case 'partial':
-    case 'partially_fulfilled':
-      return 'bg-emerald-100 text-emerald-800'
-    case 'pending':
-    case 'under_review':
-    case 'pending_delivery':
-    case 'requested':
-      return 'bg-orange-100 text-orange-800'
-    default:
-      return 'bg-blue-100 text-blue-800'
-  }
-}
-
-function expiryToneClass(value?: string): string {
-  if (!value) return 'text-slate-600'
-  const expiryTime = new Date(value).getTime()
-  if (Number.isNaN(expiryTime)) return 'text-slate-600'
-  if (expiryTime <= Date.now()) return 'text-red-800'
-  if (expiryTime - Date.now() <= 24 * 60 * 60 * 1000) return 'text-amber-800'
-  return 'text-emerald-800'
-}
-
-function isFoodExpired(value?: string): boolean {
-  if (!value) return false
-  const normalizedValue = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
-    ? value
-    : value.includes('T') ? `${value}Z` : `${value}T00:00:00Z`
-  const expiryTime = new Date(normalizedValue).getTime()
-  return Number.isFinite(expiryTime) && expiryTime <= Date.now()
-}
-
-function donationCardStatuses(donation: PublicDonation): string[] {
-  const remainingQuantity = donation.remaining_quantity ?? donation.quantity
-  const expiryValue = donation.available_until
-  const expiryTime = expiryValue
-    ? new Date(
-      /(?:Z|[+-]\d{2}:?\d{2})$/i.test(expiryValue)
-        ? expiryValue
-        : expiryValue.includes('T') ? `${expiryValue}Z` : expiryValue,
-    ).getTime()
-    : Number.NaN
-  const isExpired = Number.isFinite(expiryTime) && expiryTime <= Date.now()
-
-  if (remainingQuantity <= 0 || donation.status === 'completed') {
-    return isExpired ? ['Completed', 'Expired'] : ['Completed']
-  }
-  if (isExpired) return ['Expired']
-  return [formatStatus(donation.status)]
-}
-
-function isDonationRecord(value: unknown): value is Donation {
-  if (!value || typeof value !== 'object') return false
-  const record = value as Record<string, unknown>
-  return typeof record.id === 'string'
-    && typeof record.donor_id === 'string'
-    && typeof record.food_name === 'string'
-    && typeof record.status === 'string'
-}
-
-function isSessionUser(value: unknown): value is SessionUser {
-  if (!value || typeof value !== 'object') return false
-  const user = value as Record<string, unknown>
-  return typeof user.id === 'string'
-    && typeof user.full_name === 'string'
-    && typeof user.email === 'string'
-    && ['donor', 'requester', 'volunteer', 'ngo', 'admin'].includes(String(user.role))
-}
-
-function readStoredSessionUser(): SessionUser | null {
-  const rawSession = localStorage.getItem('smart_food_session')
-  if (!rawSession || !localStorage.getItem('smart_food_token')) {
-    localStorage.removeItem('smart_food_session')
-    return null
-  }
-  try {
-    const value: unknown = JSON.parse(rawSession)
-    if (!isSessionUser(value)) {
-      throw new Error('Stored session is missing required user details.')
-    }
-    return value
-  } catch (error) {
-    console.warn('Stored login session is invalid and will be cleared.', error)
-    localStorage.removeItem('smart_food_session')
-    return null
-  }
 }
 
 function roleDisplayName(role: Role): string {
@@ -1903,19 +1366,6 @@ function localDateInputValue(date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
-function dateTimeInputValue(value?: string): string {
-  if (!value) return ''
-  const date = new Date(value)
-  if (!Number.isFinite(date.getTime())) return ''
-  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
-  return localDate.toISOString().slice(0, 16)
-}
-
-function dateTimeInputToIso(value: string): string {
-  const timestamp = Date.parse(value)
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : ''
-}
-
 async function apiRequest(path: string, options: RequestInit = {}) {
   const token = localStorage.getItem('smart_food_token')
   const headers = new Headers(options.headers || {})
@@ -1926,29 +1376,16 @@ async function apiRequest(path: string, options: RequestInit = {}) {
     headers.set('Authorization', `Bearer ${token}`)
   }
 
-  let response: Response
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers,
-    })
-  } catch (error) {
-    const reason = error instanceof Error ? ` ${error.message}` : ''
-    throw new Error(`Could not reach the backend. Check that it is running and CORS is configured.${reason}`)
-  }
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+  })
 
   const text = await response.text()
-  let body: any = {}
-  if (text) {
-    try {
-      body = JSON.parse(text)
-    } catch {
-      throw new Error(`The backend returned an unreadable response (HTTP ${response.status}).`)
-    }
-  }
+  const body = text ? JSON.parse(text) : {}
 
   if (!response.ok) {
-    throw new Error(body.error || `Request failed (HTTP ${response.status})`)
+    throw new Error(body.error || 'Request failed')
   }
 
   return body
@@ -2027,7 +1464,10 @@ function DashboardRoleRoute({ user, onLogout, onRoleChange, onUserUpdate }: {
 }
 
 function App() {
-  const [sessionUser, setSessionUser] = useState<SessionUser | null>(readStoredSessionUser)
+  const [sessionUser, setSessionUser] = useState<SessionUser | null>(() => {
+    const raw = localStorage.getItem('smart_food_session')
+    return raw ? JSON.parse(raw) : null
+  })
 
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('smart_food_token'))
   const [verifiedToken, setVerifiedToken] = useState<string | null>(null)
@@ -2101,47 +1541,47 @@ function App() {
       setSessionUser(null)
       setToken(null)
       setVerifiedToken(null)
-      window.location.href = '/dashboard'
+      window.location.href = '/auth?mode=login'
     }
   }
 
   return (
     <BrowserRouter>
-      <Routes>
-          <Route path="/" element={<LandingPage />} />
-          <Route path="/entry" element={<EntryPage user={sessionUser} onLogin={handleLogin} />} />
+      {!authReady ? (
+        <main className="p-8 text-center text-sm text-slate-600" role="status">Checking your session…</main>
+      ) : (
+        <Routes>
+          <Route path="/" element={<EntryPage user={sessionUser} onLogin={handleLogin} />} />
           <Route path="/home" element={<LandingPage />} />
           <Route path="/auth" element={<AuthPage onLogin={handleLogin} currentUser={sessionUser} />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-          <Route path="/browse" element={<PublicBrowsePage user={sessionUser} />} />
-          <Route path="/food/:donationId" element={<PublicFoodDetailPage user={sessionUser} />} />
-          <Route
-            path="/delivery-issues/:issueId"
-            element={
-              <AuthenticationRequired user={sessionUser} authReady={authReady}>
-                {sessionUser ? <DeliveryIssuePage user={sessionUser} /> : null}
-              </AuthenticationRequired>
-            }
-          />
           <Route
             path="/delivery-feedback/:taskId"
             element={
-              <AuthenticationRequired user={sessionUser} authReady={authReady}>
-                {sessionUser ? <DeliveryFeedbackPage user={sessionUser} /> : null}
-              </AuthenticationRequired>
+              sessionUser ? (
+                <DeliveryFeedbackPage user={sessionUser} />
+              ) : (
+                <Navigate to="/auth" replace />
+              )
             }
           />
-          <Route path="/dashboard" element={<PublicBrowsePage user={sessionUser} />} />
+          <Route
+            path="/dashboard"
+            element={sessionUser ? <Navigate to={`/dashboard/${sessionUser.role}`} replace /> : <Navigate to="/auth" replace />}
+          />
           <Route
             path="/dashboard/:role"
             element={
-              <AuthenticationRequired user={sessionUser} authReady={authReady}>
-                {sessionUser ? <DashboardRoleRoute user={sessionUser} onLogout={handleLogout} onRoleChange={handleLogin} onUserUpdate={handleUserUpdate} /> : null}
-              </AuthenticationRequired>
+              sessionUser ? (
+                <DashboardRoleRoute user={sessionUser} onLogout={handleLogout} onRoleChange={handleLogin} onUserUpdate={handleUserUpdate} />
+              ) : (
+                <Navigate to="/auth" replace />
+              )
             }
           />
           <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+        </Routes>
+      )}
     </BrowserRouter>
   )
 }
@@ -2242,8 +1682,6 @@ function EntryPage({ user, onLogin }: { user: SessionUser | null; onLogin: (user
           Already have an account? <Link to="/auth?mode=login" className="font-semibold text-[#1d4d3d] hover:underline">Sign in</Link>
           {' · '}
           <Link to="/home" className="font-semibold text-[#1d4d3d] hover:underline">Learn about the platform</Link>
-          {' · '}
-          <Link to="/dashboard" className="font-semibold text-[#1d4d3d] hover:underline">Browse food and community needs</Link>
         </p>
       </section>
     </main>
@@ -2251,61 +1689,11 @@ function EntryPage({ user, onLogin }: { user: SessionUser | null; onLogin: (user
 }
 
 function LandingPage() {
-  const [overview, setOverview] = useState<PublicDashboardOverview | null>(null)
-  const [availableDonations, setAvailableDonations] = useState<PublicDonationSummary[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    let active = true
-    const refreshOverview = () => {
-      apiRequest('/dashboard/public-overview')
-        .then((overviewResponse) => {
-          if (active) setOverview(overviewResponse)
-        })
-        .catch((requestError) => {
-          if (active) {
-            setError(requestError instanceof Error ? requestError.message : 'Unable to refresh public dashboard.')
-          }
-        })
-    }
-    Promise.all([
-      apiRequest('/dashboard/public-overview'),
-      apiRequest('/donations?scope=public_available'),
-    ])
-      .then(([overviewResponse, donationsResponse]) => {
-        if (!active) return
-        setOverview(overviewResponse)
-        setAvailableDonations((donationsResponse.donations || []).map(publicDonationSummary))
-      })
-      .catch((requestError) => {
-        if (active) {
-          setError(requestError instanceof Error ? requestError.message : 'Unable to load public impact information.')
-        }
-      })
-      .finally(() => {
-        if (active) setLoading(false)
-      })
-    const handleWindowFocus = () => refreshOverview()
-    const refreshInterval = window.setInterval(() => {
-      if (document.visibilityState === 'visible') refreshOverview()
-    }, 30000)
-    window.addEventListener('focus', handleWindowFocus)
-    return () => {
-      active = false
-      window.clearInterval(refreshInterval)
-      window.removeEventListener('focus', handleWindowFocus)
-    }
-  }, [])
-
   const stats = [
-    { label: 'Meals redistributed', value: overview?.stats.meals_redistributed, icon: Leaf },
-    { label: 'Donations listed', value: overview?.stats.total_donations, icon: Users },
-    { label: 'NGOs connected', value: overview?.stats.connected_organizations, icon: HeartHandshake },
+    { label: 'Meals rescued', value: '18.4K', icon: Leaf },
+    { label: 'Active donors', value: '420+', icon: Users },
+    { label: 'NGOs connected', value: '78', icon: HeartHandshake },
   ]
-  const needs = overview?.community_needs || []
-  const featuredNeed = needs.find((need) => ['urgent', 'high', 'critical'].includes(need.urgency.toLowerCase())) || needs[0]
-  const featuredDonations = availableDonations.slice(0, 3)
 
   const features = [
     { title: 'Smart donation matching', description: 'Connect donors with urgent local needs in minutes.', icon: Sparkles },
@@ -2314,7 +1702,7 @@ function LandingPage() {
   ]
 
   return (
-    <div className="landing-page min-h-screen bg-[#f4f7f1] text-slate-900">
+    <div className="min-h-screen bg-[#f4f7f1] text-slate-900">
       <header className="mx-auto max-w-7xl px-4 pb-8 pt-6 sm:px-6 lg:px-8">
         <nav className="card-surface flex items-center justify-between rounded-full px-4 py-3 sm:px-6">
           <div className="flex items-center gap-3">
@@ -2334,12 +1722,8 @@ function LandingPage() {
           </div>
 
           <div className="flex items-center gap-3">
-            <Link to="/dashboard" className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold">
-              Continue <ArrowRight size={16} />
-            </Link>
-            <Link to="/auth?mode=login&show_login=true" className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold">
-              Login / Sign In
-            </Link>
+            <Link to="/auth?mode=login" className="secondary-btn px-4 py-2 text-sm font-medium">Sign in</Link>
+            <Link to="/auth?mode=register" className="primary-btn px-4 py-2 text-sm font-semibold">Get started</Link>
           </div>
         </nav>
       </header>
@@ -2361,10 +1745,10 @@ function LandingPage() {
             </p>
 
             <div className="mt-8 flex flex-wrap gap-4">
-              <Link to={loginUrl('donor', '/dashboard/donor#create-donation')} className="primary-btn inline-flex items-center gap-2 px-6 py-3 text-base font-semibold">
+              <Link to="/auth?mode=register" className="primary-btn inline-flex items-center gap-2 px-6 py-3 text-base font-semibold">
                 List a donation <ArrowRight size={18} />
               </Link>
-              <Link to={loginUrl('requester', '/dashboard/requester#marketplace')} className="secondary-btn inline-flex items-center gap-2 px-6 py-3 text-base font-semibold">
+              <Link to="/auth?mode=login" className="secondary-btn inline-flex items-center gap-2 px-6 py-3 text-base font-semibold">
                 Request food
               </Link>
             </div>
@@ -2375,12 +1759,11 @@ function LandingPage() {
                   <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf8ef] text-[#1d4d3d]">
                     <Icon size={18} />
                   </div>
-                  <div className="text-2xl font-bold text-slate-900">{loading || value === undefined ? '—' : value.toLocaleString()}</div>
+                  <div className="text-2xl font-bold text-slate-900">{value}</div>
                   <p className="text-sm text-slate-600">{label}</p>
                 </div>
               ))}
             </div>
-            {error && <p role="alert" className="mt-4 text-sm text-red-700">{error}</p>}
           </div>
 
           <div className="soft-grid relative overflow-hidden rounded-[32px] border border-[#dfeee1] bg-white p-5 shadow-[0_30px_80px_rgba(15,23,42,0.07)]">
@@ -2389,16 +1772,12 @@ function LandingPage() {
               <div className="rounded-3xl bg-[#ecfdf5] p-5">
                 <div className="mb-4 flex items-center justify-between">
                   <p className="text-sm font-semibold text-slate-600">Urgent community need</p>
-                  {featuredNeed && <span className="rounded-full bg-[#fef3c7] px-2.5 py-1 text-xs font-semibold text-[#92400e]">{featuredNeed.urgency || 'Active'}</span>}
+                  <span className="rounded-full bg-[#fef3c7] px-2.5 py-1 text-xs font-semibold text-[#92400e]">High priority</span>
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <div>
-                    {loading ? <p className="text-sm text-slate-600">Loading community needs…</p> : featuredNeed ? (
-                      <>
-                        <p className="text-2xl font-bold text-slate-900">{featuredNeed.category || 'Food'} · {featuredNeed.remaining_quantity ?? featuredNeed.required_quantity} servings</p>
-                        <p className="text-sm text-slate-600">{featuredNeed.location}{featuredNeed.city ? `, ${featuredNeed.city}` : ''}</p>
-                      </>
-                    ) : <p className="text-sm text-slate-600">No active community food needs are listed.</p>}
+                    <p className="text-2xl font-bold text-slate-900">275 meals</p>
+                    <p className="text-sm text-slate-600">Shivaji Nagar, Coimbatore</p>
                   </div>
                   <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-[#1d4d3d] shadow-sm">
                     <Package size={24} />
@@ -2409,18 +1788,22 @@ function LandingPage() {
               <div className="rounded-3xl border border-slate-200 bg-[#ffffff] p-4">
                 <div className="mb-3 flex items-center justify-between text-sm text-slate-600">
                   <span>Available donations</span>
-                  <span className="font-semibold text-[#1d4d3d]">{loading ? '—' : `${availableDonations.length} available`}</span>
+                  <span className="font-semibold text-[#1d4d3d]">14 today</span>
                 </div>
                 <div className="space-y-3">
-                  {loading ? <p className="rounded-2xl bg-slate-50 px-3 py-2.5 text-sm text-slate-600">Loading current listings…</p> : featuredDonations.length ? featuredDonations.map((donation) => (
-                    <div key={donation.id} className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2.5">
-                      <div className="min-w-0">
-                        <p className="truncate font-semibold text-slate-800">{donation.food_name}</p>
-                        <p className="text-xs text-slate-500">{donation.available_quantity} {donation.quantity_unit} · {donation.city || 'Location not specified'}</p>
+                  {[
+                    ['Veg biryani', '30 servings'],
+                    ['Paneer wraps', '24 packets'],
+                    ['Fresh fruit boxes', '18 boxes'],
+                  ].map(([name, amount]) => (
+                    <div key={name} className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2.5">
+                      <div>
+                        <p className="font-semibold text-slate-800">{name}</p>
+                        <p className="text-xs text-slate-500">{amount}</p>
                       </div>
-                      <Link to={`/food/${encodeURIComponent(donation.id)}`} className="ml-2 shrink-0 text-xs font-semibold text-[#1d4d3d] underline">Details</Link>
+                      <span className="rounded-full bg-[#edf8ef] px-2 py-1 text-xs font-semibold text-[#1d4d3d]">Ready</span>
                     </div>
-                  )) : <p className="rounded-2xl bg-slate-50 px-3 py-2.5 text-sm text-slate-600">No food donations are currently available.</p>}
+                  ))}
                 </div>
               </div>
 
@@ -2429,8 +1812,8 @@ function LandingPage() {
                   <p className="text-sm text-emerald-100">Impact tracking</p>
                   <ShieldCheck size={18} className="text-emerald-300" />
                 </div>
-                <p className="text-3xl font-bold">{loading || !overview ? '—' : overview.stats.meals_redistributed.toLocaleString()}</p>
-                <p className="mt-1 text-sm text-emerald-100">meals redistributed, based on completed delivery data.</p>
+                <p className="text-3xl font-bold">94%</p>
+                <p className="mt-1 text-sm text-emerald-100">of food listed was redistributed successfully within 12 hours.</p>
               </div>
             </div>
           </div>
@@ -2465,13 +1848,13 @@ function LandingPage() {
             </div>
             <div className="grid gap-6 md:grid-cols-4">
               {[
-                [overview?.stats.meals_redistributed, 'Meals redistributed'],
-                [overview?.stats.fulfilled_requests, 'Community requests fulfilled'],
-                [overview?.stats.meals_redistributed_before_expiry, 'Meals redistributed before expiry'],
-                [overview?.stats.connected_organizations, 'Partner organizations'],
+                ['12,200', 'Meals saved'],
+                ['650', 'Community requests fulfilled'],
+                ['93%', 'Food redistributed before expiry'],
+                ['84', 'Partner organizations'],
               ].map(([value, label]) => (
                 <div key={label} className="rounded-3xl border border-emerald-700/50 bg-white/5 p-5 text-center backdrop-blur-sm">
-                  <p className="text-3xl font-black">{loading || value === undefined ? '—' : Number(value).toLocaleString()}</p>
+                  <p className="text-3xl font-black">{value}</p>
                   <p className="mt-2 text-sm text-emerald-100">{label}</p>
                 </div>
               ))}
@@ -2514,417 +1897,6 @@ function LandingPage() {
   )
 }
 
-function formatPublicDate(value?: string): string {
-  if (!value) return 'Not specified'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? 'Not specified' : date.toLocaleString()
-}
-
-function publicActionUrl(user: SessionUser | null, role: UserRole, next: string): string {
-  return user ? next : loginUrl(role, next)
-}
-
-function PublicBrowsePage({ user }: { user: SessionUser | null }) {
-  const [donations, setDonations] = useState<PublicDonationSummary[]>([])
-  const [availableDonations, setAvailableDonations] = useState<PublicDonationSummary[]>([])
-  const [needs, setNeeds] = useState<PublicCommunityNeed[]>([])
-  const [overview, setOverview] = useState<PublicDashboardOverview | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    let active = true
-    Promise.all([
-      apiRequest('/dashboard/public-overview'),
-      apiRequest('/donations?scope=public_dashboard'),
-      apiRequest('/donations?scope=public_available'),
-      apiRequest('/community-needs?scope=public_dashboard'),
-    ])
-      .then(([overviewResponse, activityResponse, availableResponse, needResponse]) => {
-        if (!active) return
-        setOverview(overviewResponse)
-        setDonations((activityResponse.donations || []).map(publicDonationSummary))
-        setAvailableDonations((availableResponse.donations || []).map(publicDonationSummary))
-        setNeeds(needResponse.needs || [])
-      })
-      .catch((requestError) => {
-        if (active) {
-          setError(requestError instanceof Error ? requestError.message : 'Unable to load public listings.')
-        }
-      })
-      .finally(() => {
-        if (active) setLoading(false)
-      })
-    return () => {
-      active = false
-    }
-  }, [])
-
-  const stats = overview?.stats
-  const statsCards = [
-    { label: 'Donations listed', value: stats?.total_donations, icon: HandHeart, color: 'bg-[#edf8ef] text-[#1d4d3d]' },
-    { label: 'Available now', value: stats?.available_donations, icon: Utensils, color: 'bg-[#fff4df] text-[#b45309]' },
-    { label: 'Meals redistributed', value: stats?.meals_redistributed, icon: Heart, color: 'bg-[#fdf2f8] text-[#be185d]' },
-    { label: 'Active donations', value: stats?.active_donations, icon: PackageCheck, color: 'bg-[#eff6ff] text-[#1d4ed8]' },
-    { label: 'Requests fulfilled', value: stats?.fulfilled_requests, icon: CheckCircle2, color: 'bg-[#eff6ff] text-[#1d4ed8]' },
-    { label: 'Completed donations', value: stats?.completed_donations, icon: BadgeCheck, color: 'bg-[#edf8ef] text-[#1d4d3d]' },
-    { label: 'Meals redistributed before expiry', value: stats?.meals_redistributed_before_expiry, icon: Clock3, color: 'bg-[#fff4df] text-[#b45309]' },
-    { label: 'Organizations', value: stats?.connected_organizations, icon: Building2, color: 'bg-[#ecfeff] text-[#0f766e]' },
-  ]
-  const sectionNav = [
-    { label: 'Overview', href: '#overview', Icon: LayoutDashboard },
-    { label: 'Available food', href: '#marketplace', Icon: Utensils },
-    { label: 'Donation activity', href: '#donation-activity', Icon: HandHeart },
-    { label: 'Food matches', href: '#food-matches', Icon: Sparkles },
-    { label: 'Community needs', href: '#community-needs', Icon: HeartHandshake },
-    { label: 'Organizations', href: '#organizations', Icon: Building2 },
-    { label: 'Volunteer opportunities', href: '#volunteer-opportunities', Icon: Truck },
-    { label: 'Community updates', href: '#community-updates', Icon: Bell },
-  ]
-
-  return (
-    <main className="min-h-screen bg-[#f4f7f1] px-4 py-6 text-slate-900 sm:px-6 lg:h-screen lg:overflow-hidden lg:px-8">
-      <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-6 lg:h-full lg:flex-row lg:items-start">
-        <aside className="card-surface w-full shrink-0 rounded-[28px] p-4 lg:sticky lg:top-5 lg:max-h-full lg:overflow-y-auto lg:overscroll-contain lg:w-[260px]">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#1d4d3d] text-white"><Leaf size={20} /></div>
-            <div>
-              <p className="text-base font-bold">Smart Food</p>
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Public dashboard</p>
-            </div>
-          </div>
-          <nav aria-label="Public dashboard sections" className="mt-6 grid grid-cols-2 gap-2 lg:grid-cols-1">
-            {sectionNav.map(({ label, href, Icon }) => (
-              <a key={label} href={href} className="flex items-center gap-3 rounded-2xl px-3 py-3 text-sm font-medium text-slate-700 transition hover:bg-[#edf8ef] hover:text-[#1d4d3d]">
-                <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-[#edf8ef] text-[#1d4d3d]"><Icon size={15} /></span>
-                {label}
-              </a>
-            ))}
-          </nav>
-          <Link to="/" className="secondary-btn mt-5 inline-flex w-full justify-center px-3 py-2 text-sm font-medium">Front page</Link>
-        </aside>
-
-        <div className="min-w-0 flex-1 space-y-6 lg:h-full lg:overflow-y-auto lg:overscroll-contain lg:pb-6">
-          <header id="overview" className="card-surface scroll-mt-5 rounded-[28px] p-5">
-            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="text-sm font-semibold uppercase tracking-[0.2em] text-slate-500">Smart Food Redistribution System</p>
-                <h1 className="mt-2 text-3xl font-black text-slate-900">Public Dashboard</h1>
-                <p className="mt-1 text-sm text-slate-600">Live public information about available food, community needs, and redistribution impact.</p>
-              </div>
-              <div className="public-dashboard-actions grid grid-cols-2 gap-2">
-                <Link to={publicActionUrl(user, 'donor', '/dashboard/donor#create-donation')} className="secondary-btn w-full px-4 py-2 text-center text-sm font-semibold">Donate Food</Link>
-                <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#marketplace')} className="secondary-btn w-full px-4 py-2 text-center text-sm font-semibold">Request Food</Link>
-                <Link to={publicActionUrl(user, 'volunteer', '/dashboard/volunteer#tasks')} className="secondary-btn w-full px-4 py-2 text-center text-sm font-semibold">Volunteer</Link>
-                <Link to={publicActionUrl(user, 'ngo', '/dashboard/ngo#needs')} className="secondary-btn w-full px-4 py-2 text-center text-sm font-semibold">NGO Assist</Link>
-              </div>
-            </div>
-          </header>
-
-        {error && <p role="alert" className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">{error}</p>}
-
-          <section aria-label="Public impact statistics" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            {statsCards.map(({ label, value, icon: Icon, color }) => (
-              <article key={label} className="section-shell rounded-2xl p-4">
-                <div className={`mb-3 flex h-10 w-10 items-center justify-center rounded-xl ${color}`}><Icon size={18} /></div>
-                <p className="text-2xl font-bold text-slate-900">{loading ? '—' : (value ?? 0).toLocaleString()}</p>
-                <p className="text-sm text-slate-600">{label}</p>
-              </article>
-            ))}
-          </section>
-
-          <section id="marketplace" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Marketplace</p>
-                <h2 className="mt-1 text-2xl font-bold">Available food</h2>
-              </div>
-              <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#marketplace')} className="secondary-btn px-3 py-2 text-sm font-semibold">Request Food</Link>
-            </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading available food…</p> : availableDonations.length ? (
-              <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                {availableDonations.map((donation) => (
-                  <article key={donation.id} className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
-                    <DonationImage donation={donation} className="h-48 w-full object-cover" />
-                    <div className="p-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <div><h3 className="text-lg font-bold text-slate-900">{donation.food_name}</h3><p className="mt-1 text-sm text-slate-600">{donation.category}</p></div>
-                        <div className="flex flex-wrap justify-end gap-1.5">
-                          {donationCardStatuses(donation).map((status) => (
-                            <span key={status} className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusToneClass(status)}`}>{status}</span>
-                          ))}
-                        </div>
-                      </div>
-                      <p className="mt-3 text-sm text-slate-700">{donation.available_quantity} {donation.quantity_unit} available · {donation.city || 'Location not specified'}</p>
-                      <p className="mt-1 text-xs text-slate-500">Prepared {formatPublicDate(donation.preparation_time)} · Listed {formatPublicDate(donation.created_at)} · <span className={`font-semibold ${expiryToneClass(donation.available_until)}`}>Expires {formatPublicDate(donation.available_until)}</span></p>
-                      <div className="mt-4 flex flex-wrap gap-2">
-                        <Link to={`/food/${encodeURIComponent(donation.id)}`} className="secondary-btn inline-flex px-3 py-2 text-sm font-semibold">View details</Link>
-                        <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#marketplace')} className="primary-btn inline-flex px-3 py-2 text-sm font-semibold">Request food</Link>
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No food donations are currently available.</p>}
-          </section>
-
-          <section id="donation-activity" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">System activity</p>
-                <h2 className="mt-1 text-2xl font-bold">Donation activity</h2>
-              </div>
-              <Link to={publicActionUrl(user, 'donor', '/dashboard/donor#create-donation')} className="primary-btn px-3 py-2 text-sm font-semibold">Donate Food</Link>
-            </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading donation activity…</p> : donations.length ? (
-              <div className="mt-5 space-y-3">
-                {donations.map((donation) => (
-                  <article key={donation.id} className="flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-4 sm:flex-row">
-                    <DonationImage donation={donation} className="h-32 w-full shrink-0 rounded-xl object-cover sm:w-40" />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-start justify-between gap-2">
-                        <div><h3 className="font-bold text-slate-900">{donation.food_name}</h3><p className="text-sm text-slate-600">{donation.category} · {donation.city || 'Location not specified'}</p></div>
-                        <div className="flex flex-wrap justify-end gap-1.5">
-                          {donationCardStatuses(donation).map((status) => (
-                            <span key={status} className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusToneClass(status)}`}>{status}</span>
-                          ))}
-                        </div>
-                      </div>
-                      <p className="mt-3 text-sm text-slate-700">
-                        Listed {donation.quantity} {donation.quantity_unit} · Distributed {donation.distributed_quantity ?? 0} {donation.quantity_unit} · Remaining {donation.remaining_quantity ?? donation.quantity} {donation.quantity_unit}
-                      </p>
-                      <p className="mt-1 text-xs text-slate-500">Listed {formatPublicDate(donation.created_at)} · Valid until {formatPublicDate(donation.available_until)}</p>
-                      <Link to={`/food/${encodeURIComponent(donation.id)}`} className="mt-2 inline-flex text-sm font-semibold text-[#1d4d3d] underline">View food details</Link>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No donation activity is available.</p>}
-          </section>
-
-          <section id="food-matches" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Smart matching</p>
-              <h2 className="mt-1 text-2xl font-bold">Available food matched to community needs</h2>
-              <p className="mt-1 text-sm text-slate-600">Matches require the same category and city, with available servings sufficient for the remaining need.</p>
-            </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Checking available listings and needs…</p> : overview?.matches.length ? (
-              <div className="mt-5 grid gap-3 md:grid-cols-2">
-                {overview.matches.map((match) => (
-                  <article key={`${match.donation_id}:${match.need_id}`} className="rounded-2xl border border-slate-200 bg-white p-4">
-                    <div className="flex items-center gap-2 text-[#1d4d3d]"><Sparkles size={16} /><h3 className="font-bold">{match.food_name}</h3></div>
-                    <p className="mt-2 text-sm text-slate-700">{match.available_quantity} {match.quantity_unit} available in {match.city}</p>
-                    <p className="mt-1 text-sm text-slate-600">Matches {match.need_remaining_quantity} servings needed{match.organization_name ? ` by ${match.organization_name}` : ''}</p>
-                    <div className="mt-3 flex flex-wrap gap-3">
-                      <Link to={`/food/${encodeURIComponent(match.donation_id)}`} className="text-sm font-semibold text-[#1d4d3d] underline">View food details</Link>
-                      <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#marketplace')} className="text-sm font-semibold text-[#1d4d3d] underline">Request food</Link>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : !error ? <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No suitable food-to-need matches can be confirmed from the current category, quantity, and location data.</p> : null}
-          </section>
-
-          <section id="community-needs" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Community</p>
-                <h2 className="mt-1 text-2xl font-bold">Community food needs</h2>
-              </div>
-              <Link to={publicActionUrl(user, 'ngo', '/dashboard/ngo#needs')} className="secondary-btn px-3 py-2 text-sm font-semibold">NGO Assist</Link>
-            </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading community needs…</p> : needs.length ? (
-              <div className="mt-5 grid gap-4 md:grid-cols-2">
-                {needs.map((need) => {
-                  const deliveredQuantity = need.delivered_quantity ?? 0
-                  const remainingQuantity = need.remaining_quantity ?? Math.max(0, need.required_quantity - deliveredQuantity)
-                  const quantityUnit = quantityUnitLabel(need.required_quantity, 'servings')
-
-                  return (
-                    <article key={need.id} className="rounded-2xl border border-slate-200 bg-white p-4">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#1d4d3d]">{need.category || 'Community need'}</p>
-                          <h3 className="mt-1 text-lg font-bold text-slate-900">
-                            {need.required_quantity} {quantityUnit} needed
-                          </h3>
-                          <p className="mt-1 text-sm text-slate-600">{need.location}{need.city ? `, ${need.city}` : ''}</p>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800">{need.urgency || 'Standard'} priority</span>
-                          <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusToneClass(need.status)}`}>{formatStatus(need.status)}</span>
-                        </div>
-                      </div>
-                      {need.organization_name && <p className="mt-2 text-sm font-medium text-slate-700">Organization: {need.organization_name}</p>}
-                      {need.description && <p className="mt-3 text-sm leading-6 text-slate-700">{need.description}</p>}
-                      <dl className="mt-4 grid gap-3 rounded-xl bg-slate-50 p-3 text-sm sm:grid-cols-2">
-                        <div>
-                          <dt className="text-xs font-semibold text-slate-500">Delivered</dt>
-                          <dd className="mt-1 font-medium text-slate-800">{deliveredQuantity} {quantityUnitLabel(deliveredQuantity, 'servings')}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-xs font-semibold text-slate-500">Remaining</dt>
-                          <dd className="mt-1 font-medium text-slate-800">{remainingQuantity} {quantityUnitLabel(remainingQuantity, 'servings')}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-xs font-semibold text-slate-500">Needed by</dt>
-                          <dd className="mt-1 text-slate-700">{formatPublicDate(need.required_date)}</dd>
-                        </div>
-                        {need.created_at && (
-                          <div>
-                            <dt className="text-xs font-semibold text-slate-500">Listed</dt>
-                            <dd className="mt-1 text-slate-700">{formatPublicDate(need.created_at)}</dd>
-                          </div>
-                        )}
-                      </dl>
-                      <Link to={publicActionUrl(user, 'donor', '/dashboard/donor#community-needs')} className="secondary-btn mt-4 inline-flex px-3 py-2 text-sm font-semibold">Help meet this need</Link>
-                    </article>
-                  )
-                })}
-              </div>
-            ) : !error ? <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No active community food needs are currently listed.</p> : null}
-          </section>
-
-          <section id="organizations" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div><p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Network</p><h2 className="mt-1 text-2xl font-bold">Connected organizations</h2></div>
-              <span className="rounded-full bg-[#edf8ef] px-3 py-1 text-sm font-semibold text-[#1d4d3d]">{stats?.connected_organizations ?? 0} organizations</span>
-            </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading organizations…</p> : overview?.organizations.length ? (
-              <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                {overview.organizations.map((organization) => (
-                  <article key={`${organization.organization_name}:${organization.city}`} className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4">
-                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#edf8ef] text-[#1d4d3d]"><Building2 size={18} /></span>
-                    <div><h3 className="font-semibold text-slate-900">{organization.organization_name}</h3><p className="text-sm text-slate-600">{organization.city || 'Location not listed'}</p></div>
-                  </article>
-                ))}
-              </div>
-            ) : <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No organization details are currently available.</p>}
-          </section>
-
-          <section id="volunteer-opportunities" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div><p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Volunteer network</p><h2 className="mt-1 text-2xl font-bold">Volunteer opportunities</h2></div>
-              <Link to={publicActionUrl(user, 'volunteer', '/dashboard/volunteer#tasks')} className="secondary-btn px-3 py-2 text-sm font-semibold">View volunteer tasks</Link>
-            </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading volunteers…</p> : overview?.volunteers.length ? (
-              <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                {overview.volunteers.map((volunteer) => (
-                  <article key={volunteer.id} className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4">
-                    <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf8ef] text-[#1d4d3d]"><Truck size={18} /></span>
-                    <div><h3 className="font-semibold text-slate-900">{volunteer.full_name || 'Registered volunteer'}</h3><p className="text-sm text-slate-600">{volunteer.city || 'Location not listed'} · {formatStatus(volunteer.status)}</p></div>
-                  </article>
-                ))}
-              </div>
-            ) : !error ? <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No open volunteer opportunities are currently listed.</p> : null}
-          </section>
-
-          <section id="community-updates" className="section-shell scroll-mt-5 rounded-[28px] p-5">
-            <div><p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Community updates</p><h2 className="mt-1 text-2xl font-bold">Public updates and alerts</h2></div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading public updates…</p> : overview?.alerts.length ? (
-              <ul className="mt-5 space-y-3">
-                {overview.alerts.map((alert, index) => (
-                  <li key={`${alert.type}:${alert.created_at}:${index}`} className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4">
-                    <Bell size={18} className="mt-0.5 shrink-0 text-amber-800" />
-                    <div><p className="text-sm font-medium text-slate-900">{alert.message}</p><p className="mt-1 text-xs text-slate-600">{formatPublicDate(alert.created_at)}</p></div>
-                  </li>
-                ))}
-              </ul>
-            ) : !error ? <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">There are no current public alerts.</p> : null}
-          </section>
-
-          <section className="section-shell flex flex-wrap items-center justify-between gap-4 rounded-[28px] p-5">
-            <div><h2 className="text-xl font-bold">Protected application actions</h2><p className="mt-1 text-sm text-slate-600">Browsing is public. Sign in is requested only when you choose an action that requires an account.</p></div>
-            <div className="flex flex-wrap gap-2">
-              <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#requests')} className="secondary-btn px-3 py-2 text-sm font-semibold">My Requests</Link>
-              <Link to={publicActionUrl(user, 'donor', '/dashboard/donor#donations')} className="secondary-btn px-3 py-2 text-sm font-semibold">My Donations</Link>
-              <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#requests')} className="secondary-btn px-3 py-2 text-sm font-semibold">Raise Issue</Link>
-              <Link to={publicActionUrl(user, 'volunteer', '/dashboard/volunteer#tasks')} className="secondary-btn px-3 py-2 text-sm font-semibold">Volunteer</Link>
-            </div>
-          </section>
-        </div>
-      </div>
-    </main>
-  )
-}
-
-function PublicFoodDetailPage({ user }: { user: SessionUser | null }) {
-  const { donationId = '' } = useParams()
-  const [donation, setDonation] = useState<PublicDonation | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    let active = true
-    apiRequest(`/donations/${encodeURIComponent(donationId)}`)
-      .then((response) => {
-        if (active) setDonation(response.donation || null)
-      })
-      .catch((requestError) => {
-        if (active) setError(requestError instanceof Error ? requestError.message : 'Unable to load this food listing.')
-      })
-      .finally(() => {
-        if (active) setLoading(false)
-      })
-    return () => {
-      active = false
-    }
-  }, [donationId])
-
-  return (
-    <main className="min-h-screen bg-[#f4f7f1] px-4 py-6 text-slate-900 sm:px-6 lg:px-8">
-      <section className="section-shell mx-auto max-w-4xl rounded-[28px] p-5 sm:p-7">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <Link to="/dashboard" className="text-sm font-semibold text-[#1d4d3d] underline">Browse all food</Link>
-          <Link to="/home" className="text-sm font-semibold text-[#1d4d3d] underline">Home</Link>
-        </div>
-        {loading ? <p className="mt-6 text-sm text-slate-600">Loading food details…</p> : error ? (
-          <p role="alert" className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">{error}</p>
-        ) : donation ? (
-          <div className="mt-5 grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
-            <DonationImage donation={donation} className="h-72 w-full rounded-2xl object-cover" />
-            <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">{donation.category}</p>
-              <h1 className="mt-2 text-3xl font-black">{donation.food_name}</h1>
-              <p className="mt-3 text-slate-700">{donation.description || 'No additional description provided.'}</p>
-              <dl className="mt-5 grid gap-3 rounded-2xl bg-slate-50 p-4 text-sm sm:grid-cols-2">
-                <div><dt className="font-semibold text-slate-500">Original quantity</dt><dd className="mt-1">{donation.quantity} {donation.quantity_unit}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Distributed</dt><dd className="mt-1">{donation.distributed_quantity ?? 0} {donation.quantity_unit}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Remaining</dt><dd className="mt-1">{donation.remaining_quantity ?? donation.quantity} {donation.quantity_unit}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Available to request</dt><dd className="mt-1">{donation.available_quantity ?? 0} {donation.quantity_unit}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Status</dt><dd className="mt-1">{formatStatus(donation.status)}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Location</dt><dd className="mt-1">{donation.city || 'Not specified'}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Category</dt><dd className="mt-1">{donation.category}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Prepared</dt><dd className="mt-1">{formatPublicDate(donation.preparation_time)}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Listed</dt><dd className="mt-1">{formatPublicDate(donation.created_at)}</dd></div>
-                <div><dt className="font-semibold text-slate-500">Exact expiry</dt><dd className={`mt-1 font-semibold ${expiryToneClass(donation.available_until)}`}>{formatPublicDate(donation.available_until)}</dd></div>
-              </dl>
-              {donation.is_requestable ? (
-                <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#marketplace')} className="primary-btn mt-5 inline-flex px-5 py-3 text-sm font-semibold">
-                  {user ? 'Request food' : 'Sign in to request food'}
-                </Link>
-              ) : <p className="mt-5 text-sm font-semibold text-slate-600">{donation.status === 'completed' ? 'This donation was fully distributed.' : donation.status === 'expired' ? 'This donation has expired and cannot be requested.' : 'No quantity is currently available to request.'}</p>}
-              <section className="mt-6" aria-label="Donation journey">
-                <h2 className="text-lg font-bold text-slate-900">Donation journey</h2>
-                {donation.status_history?.length ? (
-                  <ol className="mt-3 space-y-2 border-l-2 border-[#d8e8dc] pl-4">
-                    {donation.status_history.map((entry, index) => (
-                      <li key={`${entry.status}:${entry.created_at}:${index}`} className="text-sm text-slate-700">
-                        <span className="font-semibold">{formatStatus(entry.status)}</span>
-                        <span className="ml-2 text-slate-500">{formatPublicDate(entry.created_at)}</span>
-                      </li>
-                    ))}
-                  </ol>
-                ) : <p className="mt-2 text-sm text-slate-500">No donation status history has been recorded.</p>}
-              </section>
-            </div>
-          </div>
-        ) : <p className="mt-6 text-sm text-slate-600">This food listing is unavailable.</p>}
-      </section>
-    </main>
-  )
-}
-
 function roleEmailStorageKey(role: UserRole): string {
   return `smart_food_email_suggestions_${role}`
 }
@@ -2961,8 +1933,6 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
   const [mode, setMode] = useState<'login' | 'register'>(searchParams.get('mode') === 'register' ? 'register' : 'login')
   const queryRole = searchParams.get('role')
   const requestedRole = isUserRole(queryRole) ? queryRole : undefined
-  const requestedNext = safeNextPath(searchParams.get('next'))
-  const showLoginForm = searchParams.get('show_login') === 'true'
   const [emailSuggestions, setEmailSuggestions] = useState<string[]>(() => readRoleEmailSuggestions(requestedRole || 'donor'))
   const [emailSuggestionsOpen, setEmailSuggestionsOpen] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -2988,16 +1958,16 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
   }, [searchParams])
 
   useEffect(() => {
-    if (currentUser && !showLoginForm) {
-      navigate(requestedNext || `/dashboard/${currentUser.role}`, { replace: true })
+    if (currentUser) {
+      navigate(`/dashboard/${currentUser.role}`, { replace: true })
     }
-  }, [currentUser, navigate, requestedNext, showLoginForm])
+  }, [currentUser, navigate])
 
   const handleChange = (field: string, value: string) => {
     setForm((previous) => ({ ...previous, [field]: value }))
   }
 
-  const handleRoleChange = (role: UserRole) => {
+  const handleRegistrationRoleChange = (role: UserRole) => {
     setForm((previous) => ({ ...previous, role, email: '' }))
     setEmailSuggestions(readRoleEmailSuggestions(role))
     setEmailSuggestionsOpen(false)
@@ -3011,8 +1981,8 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setMessage('')
-    if (mode === 'login' && !form.password.trim()) {
-      setMessage('Enter your password. Email can be omitted only in local demo mode.')
+    if (mode === 'login' && (!form.email.trim() || !form.password.trim())) {
+      setMessage('Enter both your email and password.')
       return
     }
     setLoading(true)
@@ -3020,7 +1990,7 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
     try {
       const endpoint = mode === 'login' ? '/auth/login' : '/auth/register'
       const payload = mode === 'login'
-        ? { email: form.email.trim(), password: form.password, role: form.role }
+        ? { email: form.email.trim(), password: form.password, role: requestedRole || form.role }
         : { ...form }
 
       const response = await apiRequest(endpoint, {
@@ -3032,7 +2002,7 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
         saveRoleEmailSuggestion(response.user.role, form.email)
       }
       onLogin(response.user, response.token)
-      navigate(requestedNext || `/dashboard/${response.user.role}`, { replace: true })
+      navigate(`/dashboard/${response.user.role}`, { replace: true })
     } catch (error) {
       const text = error instanceof Error ? error.message : 'Authentication failed'
       if (mode === 'register' && text.includes('already exists')) {
@@ -3069,12 +2039,12 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="rounded-2xl bg-white/5 p-4 backdrop-blur-sm">
-                <p className="text-2xl font-black">Public</p>
-                <p className="mt-1 text-sm text-emerald-100">browse food and community needs without signing in</p>
+                <p className="text-2xl font-black">12K+</p>
+                <p className="mt-1 text-sm text-emerald-100">meals rescued</p>
               </div>
               <div className="rounded-2xl bg-white/5 p-4 backdrop-blur-sm">
-                <p className="text-2xl font-black">Protected</p>
-                <p className="mt-1 text-sm text-emerald-100">sign in only when taking an account action</p>
+                <p className="text-2xl font-black">94%</p>
+                <p className="mt-1 text-sm text-emerald-100">successful redistribution</p>
               </div>
             </div>
           </div>
@@ -3096,31 +2066,10 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
                   onClick={() => setMode(value)}
                   className={`rounded-full px-4 py-2 text-sm font-semibold transition ${mode === value ? 'bg-white text-[#1d4d3d] shadow-sm' : 'text-slate-600'}`}
                 >
-                  <span className="inline-flex items-center gap-1.5">{value === 'login' ? <LogIn size={15} /> : <Plus size={15} />}{value === 'login' ? 'Login' : 'Sign Up'}</span>
+                  <span className="inline-flex items-center gap-1.5">{value === 'login' ? <LogIn size={15} /> : <Plus size={15} />}{value === 'login' ? 'Login' : 'Register'}</span>
                 </button>
               ))}
             </div>
-
-            {mode === 'login' && (
-              <div className="mb-6 grid grid-cols-2 gap-2">
-                {([
-                  ['donor', 'Donor'],
-                  ['requester', 'Request Food / Receiver'],
-                  ['volunteer', 'Volunteer'],
-                  ['ngo', 'NGO / Organization'],
-                ] as const).map(([role, label]) => (
-                  <button
-                    key={role}
-                    type="button"
-                    onClick={() => handleRoleChange(role)}
-                    aria-pressed={form.role === role}
-                    className={`inline-flex min-h-11 w-full items-center justify-center rounded-2xl border px-3 py-2 text-center text-sm font-semibold transition ${form.role === role ? 'border-[#1d4d3d] bg-[#1d4d3d] text-white' : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
 
             <form
               id={`smart-food-${form.role}-login-form`}
@@ -3188,18 +2137,17 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
                     </div>
                   )}
                 </div>
-                {mode === 'login' && <p className="mt-1 text-xs text-slate-500">Email may be omitted in local demo mode.</p>}
               </div>
 
               {mode === 'register' && (
                 <>
                   <div>
                     <label className="mb-2 block text-sm font-medium text-slate-700">Role</label>
-                    <select value={form.role} onChange={(event) => handleRoleChange(event.target.value as UserRole)} className="input-shell">
+                    <select value={form.role} onChange={(event) => handleRegistrationRoleChange(event.target.value as UserRole)} className="input-shell">
                       <option value="donor">Donor</option>
-                      <option value="requester">Request Food / Receiver</option>
+                      <option value="requester">Food Requester</option>
                       <option value="volunteer">Volunteer</option>
-                      <option value="ngo">NGO / Organization</option>
+                      <option value="ngo">NGO / Charity</option>
                     </select>
                   </div>
 
@@ -3253,7 +2201,7 @@ function AuthPage({ onLogin, currentUser }: { onLogin: (user: SessionUser, token
               <p>
                 {mode === 'login' ? 'New here?' : 'Already joined?'}{' '}
                 <button type="button" onClick={() => setMode(mode === 'login' ? 'register' : 'login')} className="font-semibold text-[#1d4d3d] hover:underline">
-                  {mode === 'login' ? 'Sign Up' : 'Sign in'}
+                  {mode === 'login' ? 'Create an account' : 'Sign in'}
                 </button>
               </p>
             </div>
@@ -3319,7 +2267,6 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
   const [donations, setDonations] = useState<Donation[]>([])
   const [requests, setRequests] = useState<RequestItem[]>([])
   const [deliveryTasks, setDeliveryTasks] = useState<DeliveryTask[]>([])
-  const [deliveryIssues, setDeliveryIssues] = useState<DeliveryIssue[]>([])
   const [donationCancellations, setDonationCancellations] = useState<DonationCancellation[]>([])
   const [notifications, setNotifications] = useState<NotificationItem[]>([])
   const [needs, setNeeds] = useState<CommunityNeed[]>([])
@@ -3340,14 +2287,13 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
       const canViewNeeds = user.role === 'donor' || user.role === 'ngo' || user.role === 'admin'
       const canViewDeliveryTasks = user.role === 'volunteer' || user.role === 'ngo'
       const canViewCancellations = user.role === 'ngo'
-      const [overviewResponse, donationResponse, notificationResponse, requestResponse, needResponse, deliveryResponse, issueResponse] = await Promise.all([
+      const [overviewResponse, donationResponse, notificationResponse, requestResponse, needResponse, deliveryResponse] = await Promise.all([
         apiRequest('/dashboard/overview'),
         canBrowseDonations ? apiRequest('/donations') : Promise.resolve({ donations: [] }),
         apiRequest('/notifications'),
         canViewRequests ? apiRequest('/donation-requests') : Promise.resolve({ requests: [] }),
         canViewNeeds ? apiRequest('/community-needs') : Promise.resolve({ needs: [] }),
         canViewDeliveryTasks ? apiRequest('/delivery-tasks') : Promise.resolve({ tasks: [] }),
-        user.role === 'donor' ? apiRequest('/delivery-issues') : Promise.resolve({ issues: [] }),
       ])
 
       setOverview(overviewResponse)
@@ -3356,7 +2302,6 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
       setRequests(requestResponse.requests || [])
       setNeeds(needResponse.needs || [])
       setDeliveryTasks(deliveryResponse.tasks || [])
-      setDeliveryIssues(issueResponse.issues || [])
       setDataLoadError('')
 
       if (canViewCancellations) {
@@ -3678,18 +2623,7 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
           {loading ? (
             <div className="card-surface rounded-[28px] p-8 text-center text-slate-600">Loading dashboard…</div>
           ) : user.role === 'donor' ? (
-            <DonorDashboard
-              user={user}
-              overview={overview}
-              donations={donations}
-              requests={requests}
-              needs={needs}
-              deliveryIssues={deliveryIssues}
-              onReload={reloadDashboardData}
-              onDonationCreated={(donation) => setDonations((current) => (
-                current.some((item) => item.id === donation.id) ? current : [donation, ...current]
-              ))}
-            />
+            <DonorDashboard user={user} overview={overview} donations={donations} requests={requests} needs={needs} onReload={reloadDashboardData} />
           ) : user.role === 'admin' ? (
             <AdminDashboard overview={overview} donations={donations} requests={requests} needs={needs} />
           ) : (
@@ -3712,7 +2646,7 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
   )
 }
 
-function DonorDashboard({ user, overview, donations, requests, needs, deliveryIssues, onReload, onDonationCreated }: { user: SessionUser; overview: DashboardSummary | null; donations: Donation[]; requests: RequestItem[]; needs: CommunityNeed[]; deliveryIssues: DeliveryIssue[]; onReload: () => Promise<void>; onDonationCreated: (donation: Donation) => void }) {
+function DonorDashboard({ user, overview, donations, requests, needs, onReload }: { user: SessionUser; overview: DashboardSummary | null; donations: Donation[]; requests: RequestItem[]; needs: CommunityNeed[]; onReload: () => Promise<void> }) {
   const [message, setMessage] = useState('')
   const [editingDonationId, setEditingDonationId] = useState<string | null>(null)
   const [imageUploading, setImageUploading] = useState(false)
@@ -3813,8 +2747,22 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
     setDownloadingCertificateId(certificate.id)
     setCertificatesError('')
     try {
+      if (isDonorCertificate(certificate)) {
+        const milestoneDonation = donationCertificates.find((item) => item.donation_id === certificate.donation_id)
+        if (!openCertificatePrintWindow(createDonationCertificateHtml(certificate, milestoneDonation), certificate.certificate_id)) {
+          throw new Error('Your browser blocked the certificate print window. Allow pop-ups to print or save this certificate.')
+        }
+        return
+      }
       const pdf = await createCertificatePdf(createCertificateSvg(certificate))
-      await requestCertificateDownload(certificate.certificate_id, pdf)
+      const url = URL.createObjectURL(pdf)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `${certificate.certificate_id}.pdf`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
     } catch (error) {
       setCertificatesError(error instanceof Error ? error.message : 'Unable to generate the certificate PDF.')
     } finally {
@@ -3839,27 +2787,6 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
     image_url: '',
     image_source: '',
   })
-  const currentFoodName = form.food_name.trim()
-  const donorUploadedImage = isDonorUploadedImage(form)
-  const [searchedFoodImage, setSearchedFoodImage] = useState<{ foodName: string; imageUrl: string | null }>({ foodName: '', imageUrl: null })
-  useEffect(() => {
-    let active = true
-    if (!currentFoodName || donorUploadedImage) {
-      setSearchedFoodImage({ foodName: currentFoodName, imageUrl: null })
-      return () => { active = false }
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      void searchFoodImage(currentFoodName).then((imageUrl) => {
-        if (active) setSearchedFoodImage({ foodName: currentFoodName, imageUrl })
-      })
-    }, 400)
-    return () => {
-      active = false
-      window.clearTimeout(timeoutId)
-    }
-  }, [currentFoodName, donorUploadedImage])
-
   const donorDonationIds = new Set(donations.map((donation) => donation.id))
   const supplierRequests = requests.filter((request) => !request.multi_contribution && request.donation_id && donorDonationIds.has(request.donation_id))
   const openFoodRequests = requests.filter((request) =>
@@ -3870,13 +2797,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
       && !['completed', 'fulfilled', 'rejected', 'cancelled'].includes(request.status)
     ),
   )
-  const previewImage = !currentFoodName
-    ? ''
-    : donorUploadedImage
-      ? getDonationImage(form)
-      : searchedFoodImage.foodName === currentFoodName && searchedFoodImage.imageUrl
-        ? searchedFoodImage.imageUrl
-        : getDonationImage(form)
+  const previewImage = getDonationImage(form)
 
   const fillFormForEdit = (donation: Donation) => {
     setEditingDonationId(donation.id)
@@ -3890,36 +2811,53 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
       is_veg: String(Boolean(donation.is_veg)),
       pickup_location: donation.pickup_location,
       city: donation.city,
-      available_until: dateTimeInputValue(donation.available_until),
-      pickup_available_until: dateTimeInputValue(donation.pickup_available_until),
-      preparation_time: dateTimeInputValue(donation.preparation_time),
+      available_until: donation.available_until ? new Date(donation.available_until).toISOString().slice(0, 16) : '',
+      pickup_available_until: donation.pickup_available_until ? new Date(donation.pickup_available_until).toISOString().slice(0, 16) : '',
+      preparation_time: donation.preparation_time ? new Date(donation.preparation_time).toISOString().slice(0, 16) : '',
       handling_instructions: donation.handling_instructions || '',
       image_url: donation.image_url || '',
       image_source: donation.image_source || (donation.image_url ? 'legacy' : ''),
     })
     setImageMessage('')
     setFailedPreviewUrl('')
-    document.getElementById('create-donation')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
   const updateField = (field: string, value: string) => setForm((current) => ({ ...current, [field]: value }))
 
   const handleFoodNameChange = (foodName: string) => {
-    const normalizedFoodName = foodName.trim()
-    setSearchedFoodImage({ foodName: normalizedFoodName, imageUrl: null })
+    const preserveDonorUpload = isDonorUploadedImage(form)
+    const localPhoto = getLocalFoodFallbackImage(foodName, form.category)
     setForm((current) => ({
       ...current,
       food_name: foodName,
-      ...(isDonorUploadedImage(current) ? {} : { image_url: '', image_source: '' }),
+      ...(preserveDonorUpload ? {} : {
+        image_url: localPhoto,
+        image_source: localPhoto ? 'fallback' : '',
+      }),
     }))
     setFailedPreviewUrl('')
-    setImageMessage('')
+    setImageMessage(preserveDonorUpload || !foodName.trim()
+      ? ''
+      : localPhoto
+        ? 'Using a locally stored food photo.'
+        : 'No matching local food photo is available; a neutral placeholder will be shown.')
   }
 
   const handleFoodCategoryChange = (category: string) => {
     setForm((current) => {
-      return { ...current, category }
+      if (isDonorUploadedImage(current)) {
+        return { ...current, category }
+      }
+      const localPhoto = getLocalFoodFallbackImage(current.food_name, category)
+      return {
+        ...current,
+        category,
+        image_url: localPhoto,
+        image_source: localPhoto ? 'fallback' : '',
+      }
     })
+    setFailedPreviewUrl('')
   }
 
   const handleImageUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -3966,8 +2904,9 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
       return
     }
 
-    if (!form.food_name.trim() || !form.category || !form.pickup_location.trim() || !form.city.trim() || !form.available_until || !form.preparation_time) {
-      setMessage('Please complete the food name, category, preparation time, expiry time, location, and other required fields.')
+    if (!form.food_name.trim() || !form.category || !form.pickup_location.trim() || !form.city.trim() || !form.available_until || !form.preparation_time
+      || (!editingDonationId && !form.pickup_available_until)) {
+      setMessage('Please provide the food expiry date and time, pickup deadline, and complete all other required donation fields.')
       return
     }
     if (!Number.isFinite(Number(form.quantity)) || Number(form.quantity) <= 0 || !Number.isFinite(Number(form.servings)) || Number(form.servings) <= 0) {
@@ -3978,10 +2917,6 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
     const foodExpiry = Date.parse(form.available_until)
     if (!Number.isFinite(preparationTime) || !Number.isFinite(foodExpiry) || foodExpiry <= preparationTime) {
       setMessage('Food expiry date and time must be valid and later than the preparation time.')
-      return
-    }
-    if (foodExpiry <= Date.now()) {
-      setMessage('Food expiry date and time must be in the future.')
       return
     }
     if (form.pickup_available_until) {
@@ -3995,63 +2930,50 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
         return
       }
     }
+    if (!editingDonationId && !form.pickup_available_until) {
+      setMessage('Please enter the Pickup Available Until date and time.')
+      return
+    }
     if (imageUploading) {
       setMessage('Please wait for the image upload to finish before saving.')
       return
+    }
+    const payload = {
+      ...form,
+      food_name: form.food_name.trim(),
+      category: form.category.trim(),
+      image_url: isDonorUploadedImage(form)
+        ? form.image_url
+        : getLocalFoodFallbackImage(form.food_name, form.category),
+      image_source: isDonorUploadedImage(form)
+        ? form.image_source
+        : getLocalFoodFallbackImage(form.food_name, form.category)
+          ? 'fallback'
+          : '',
+      pickup_location: form.pickup_location.trim(),
+      city: form.city.trim(),
+      quantity: Number(form.quantity),
+      servings: Number(form.servings),
+      is_veg: form.is_veg === 'true',
     }
 
     savingDonationRef.current = true
     setSavingDonation(true)
     try {
-      const donorUploadedImage = isDonorUploadedImage(form)
-      const searchedImageUrl = donorUploadedImage ? '' : await searchFoodImage(form.food_name)
-      const imageUrl = donorUploadedImage
-        ? form.image_url || ''
-        : searchedImageUrl || form.image_url || ''
-      const imageSource = donorUploadedImage ? 'uploaded' : imageUrl ? 'search' : ''
-      if (!donorUploadedImage) {
-        setForm((current) => current.food_name.trim() === form.food_name.trim()
-          ? { ...current, image_url: imageUrl || '', image_source: imageSource }
-          : current)
-      }
-
-      const payload = {
-        ...form,
-        food_name: form.food_name.trim(),
-        category: form.category.trim(),
-        image_url: imageUrl,
-        image_source: imageSource,
-        pickup_location: form.pickup_location.trim(),
-        city: form.city.trim(),
-        quantity: Number(form.quantity),
-        servings: Number(form.servings),
-        is_veg: form.is_veg === 'true',
-        preparation_time: dateTimeInputToIso(form.preparation_time),
-        available_until: dateTimeInputToIso(form.available_until),
-        pickup_available_until: dateTimeInputToIso(form.pickup_available_until || form.available_until),
-      }
-
       if (editingDonationId) {
-        const response = await apiRequest(`/donations/${editingDonationId}`, {
+        await apiRequest(`/donations/${editingDonationId}`, {
           method: 'PATCH',
           body: JSON.stringify(payload),
         })
-        if (!isDonationRecord(response.donation) || response.donation.donor_id !== user.id) {
-          throw new Error('The server did not confirm this donation update.')
-        }
         submissionKeyRef.current = null
         setMessage('Donation updated successfully.')
       } else {
         submissionKeyRef.current ??= crypto.randomUUID()
-        const response = await apiRequest('/donations', {
+        await apiRequest('/donations', {
           method: 'POST',
           headers: { 'Idempotency-Key': submissionKeyRef.current },
           body: JSON.stringify(payload),
         })
-        if (!isDonationRecord(response.donation) || response.donation.donor_id !== user.id) {
-          throw new Error('The server did not confirm that this donation was saved to your account.')
-        }
-        onDonationCreated(response.donation)
         setMessage('Donation created successfully.')
         submissionKeyRef.current = null
       }
@@ -4230,24 +3152,6 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
         ))}
       </section>
 
-      {deliveryIssues.length > 0 && (
-        <section className="section-shell rounded-[28px] p-5">
-          <h2 className="text-xl font-bold text-slate-900">Issues linked to your donations</h2>
-          <div className="mt-4 space-y-3">
-            {deliveryIssues.map((issue) => (
-              <Link key={issue.id} to={`/delivery-issues/${encodeURIComponent(issue.id)}`} className="block rounded-2xl border border-amber-200 bg-amber-50/50 p-4 hover:bg-amber-50">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="font-semibold text-slate-900">{issue.category || 'Delivery'} · {formatStatus(issue.status)}</p>
-                  <span className="text-xs text-slate-500">Issue {issue.id}</span>
-                </div>
-                <p className="mt-2 text-sm text-slate-700">{issue.description}</p>
-                {issue.resolution_note && <p className="mt-2 text-sm text-slate-600">NGO response: {issue.resolution_note}</p>}
-              </Link>
-            ))}
-          </div>
-        </section>
-      )}
-
       <section className="section-shell rounded-[28px] p-5" aria-labelledby="donor-donation-certificates-heading">
         <h3 id="donor-donation-certificates-heading" className="text-xl font-bold text-slate-900">My Donation Certificates</h3>
         <p className="mt-2 text-sm text-slate-600">Based on {completedDonationCount} completed donation{completedDonationCount === 1 ? '' : 's'} in your saved donation records.</p>
@@ -4344,7 +3248,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
         )}
       </section>
 
-      <section id="create-donation" className="grid gap-6">
+      <section className="grid gap-6">
         <div className="section-shell rounded-[28px] p-5">
           <h2 className="flex items-center gap-2 text-2xl font-bold text-slate-900">{editingDonationId ? <Pencil size={21} /> : <Plus size={21} />}{editingDonationId ? 'Edit donation' : 'Create a food donation'}</h2>
           <p className="mt-1 text-sm text-slate-500">Share food details and timing so the right organizations can respond quickly.</p>
@@ -4352,7 +3256,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
           <form onSubmit={submitDonation} className="mt-5 grid w-full max-w-5xl gap-4 md:grid-cols-2">
             <div className="md:col-span-2">
               <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><Utensils size={15} />Food name</label>
-              <input value={form.food_name} onChange={(event) => handleFoodNameChange(event.target.value)} className="input-shell" placeholder="Enter a food name" required disabled={savingDonation} />
+              <input value={form.food_name} onChange={(event) => handleFoodNameChange(event.target.value)} className="input-shell" placeholder="Veg biryani" required />
             </div>
             <div>
               <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><Package size={15} />Category</label>
@@ -4405,8 +3309,9 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
                 onChange={(event) => updateField('pickup_available_until', event.target.value)}
                 className="input-shell"
                 aria-describedby="pickup-deadline-help"
+                required={!editingDonationId || Boolean(form.pickup_available_until)}
               />
-              <p id="pickup-deadline-help" className="mt-1 text-xs text-slate-500">Last time a receiver or volunteer can collect this food. If left blank, the expiry time is used.</p>
+              <p id="pickup-deadline-help" className="mt-1 text-xs text-slate-500">Last time a receiver or volunteer can collect this food. Must be no later than its expiry.</p>
             </div>
             <div className="md:col-span-2">
               <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><MapPin size={15} />Pickup location</label>
@@ -4453,7 +3358,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
               {imageMessage && <p className="mt-2 text-xs text-slate-500">{imageMessage}</p>}
             </div>
 
-            {message && <div className={`md:col-span-2 rounded-2xl border px-4 py-3 text-sm ${/successfully|was submitted|thank you/i.test(message) ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-red-200 bg-red-50 text-red-700'}`} role={/successfully|was submitted|thank you/i.test(message) ? 'status' : 'alert'}>{message}</div>}
+            {message && <div className="md:col-span-2 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{message}</div>}
 
             <div className="md:col-span-2 flex justify-end gap-3">
               {editingDonationId && (
@@ -4534,9 +3439,9 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
                       <p className="mt-1 text-xs text-slate-500">
                         Receiver: {requestItem.receiver_name || 'Food receiver'}{requestItem.receiver_city ? ` · ${requestItem.receiver_city}` : ''} · Status: {formatRequestStatus(requestItem.status)}
                       </p>
-                      <p className="mt-1 text-xs text-slate-500">Delivery / Drop-off Location: {requestItem.delivery_location || 'Not provided'}</p>
+                      {requestItem.delivery_location && <p className="mt-1 text-xs text-slate-500">Delivery: {requestItem.delivery_location}</p>}
                     </div>
-                    {myContribution && <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusToneClass(myContribution.delivery_status || myContribution.status)}`}>Your contribution: {myContribution.quantity} {myContribution.quantity_unit} · {formatStatus(myContribution.delivery_status || myContribution.status)}</span>}
+                    {myContribution && <span className="rounded-full bg-[#edf8ef] px-3 py-1 text-xs font-semibold text-[#1d4d3d]">Your contribution: {myContribution.quantity} {myContribution.quantity_unit} · {formatStatus(myContribution.delivery_status || myContribution.status)}</span>}
                   </div>
                   {requestItem.multi_contribution && !myContribution && !['fulfilled', 'completed', 'rejected', 'cancelled'].includes(requestItem.status) && (requestItem.remaining_quantity ?? 0) > 0 && (
                     <div className="mt-4 grid gap-3 md:grid-cols-[1fr_10rem_auto] md:items-end">
@@ -4590,7 +3495,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
       <section id="donations" className="section-shell rounded-[28px] p-5">
         <div className="mb-5 flex items-center justify-between">
           <h2 className="text-2xl font-bold text-slate-900">My donations</h2>
-          <span className="rounded-full bg-[#edf8ef] px-2.5 py-1 text-xs font-semibold text-[#1d4d3d]">{donations.filter((donation) => ['available', 'requested', 'accepted'].includes(donation.status)).length} active listings</span>
+          <span className="rounded-full bg-[#edf8ef] px-2.5 py-1 text-xs font-semibold text-[#1d4d3d]">{donations.filter((donation) => donation.status !== 'cancelled').length} active listings</span>
         </div>
 
         {donations.length ? (
@@ -4614,7 +3519,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
                         <div>
                           <p className="font-semibold text-slate-800">{donation.food_name}</p>
                           <p className="text-xs text-slate-500">{donation.category}</p>
-                          <p className={`mt-1 text-xs font-medium ${expiryToneClass(donation.available_until)}`}>Food expiry: {foodExpiryDateTime(donation.available_until)}</p>
+                          <p className="mt-1 text-xs text-slate-600">Food expiry: {foodExpiryDateTime(donation.available_until)}</p>
                           <p className="mt-1 text-xs text-slate-600">Pickup available until: {pickupDeadlineDateTime(donation.pickup_available_until)}</p>
                           {donation.feedback?.length ? (
                             <div className="mt-2 space-y-2 rounded-lg bg-emerald-50 p-2 text-xs text-emerald-900">
@@ -4642,7 +3547,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
                     </td>
                     <td className="px-4 py-3 text-slate-600">{donation.quantity} {donation.quantity_unit}</td>
                     <td className="px-4 py-3">
-                      <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${statusToneClass(donation.status)}`}>{formatStatus(donation.status)}</span>
+                      <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${donation.status === 'cancelled' ? 'bg-red-50 text-red-700' : 'bg-[#edf8ef] text-[#1d4d3d]'}`}>{formatStatus(donation.status)}</span>
                       {donation.status === 'cancelled' && (
                         <div className="mt-1 text-xs text-slate-600">
                           <p>Reason: {donation.cancellation_reason || 'Not recorded'}</p>
@@ -4713,7 +3618,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
               <div key={need.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
                 <div className="flex items-center justify-between">
                   <p className="text-lg font-bold text-slate-900">{need.category}</p>
-                  <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] ${statusToneClass(need.status)}`}>{formatStatus(need.status)}</span>
+                  <span className="rounded-full bg-[#ecfdf5] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#1d4d3d]">{formatStatus(need.status)}</span>
                 </div>
                 <p className="mt-2 text-sm text-slate-600">{need.location} • {need.required_quantity} required</p>
                 <label className="mt-3 block text-xs font-semibold text-slate-700">
@@ -4858,19 +3763,10 @@ function NgoDashboard({
   onUserUpdate: (user: SessionUser) => void
 }) {
   const [message, setMessage] = useState('')
-  const [acceptingTaskId, setAcceptingTaskId] = useState<string | null>(null)
   const [issueStatusDrafts, setIssueStatusDrafts] = useState<Record<string, DeliveryIssue['status']>>({})
-  const [issueActionDrafts, setIssueActionDrafts] = useState<Record<string, '' | 'yes' | 'no'>>({})
-  const [issueActionNoteDrafts, setIssueActionNoteDrafts] = useState<Record<string, string>>({})
   const [feedbackDeliveryTaskId, setFeedbackDeliveryTaskId] = useState<string | null>(null)
   const [feedbackDialogMode, setFeedbackDialogMode] = useState<'feedback' | 'issue'>('feedback')
   const [requestQuantities, setRequestQuantities] = useState<Record<string, string>>({})
-  const [requestDeliveryLocations, setRequestDeliveryLocations] = useState<Record<string, string>>({})
-  const [requestSchedules, setRequestSchedules] = useState<Record<string, {
-    priority: 'high' | 'medium' | 'low'
-    required_date: string
-    required_time: string
-  }>>({})
   const [requestErrors, setRequestErrors] = useState<Record<string, string>>({})
   const [submittingRequestIds, setSubmittingRequestIds] = useState<Set<string>>(() => new Set())
   const [requestFeedback, setRequestFeedback] = useState<Record<string, { type: 'success' | 'error'; text: string }>>({})
@@ -4920,10 +3816,6 @@ function NgoDashboard({
     city: user.city || '',
   })
   const [taskForm, setTaskForm] = useState({ request_id: '', dropoff_location: '', dropoff_instructions: '' })
-  const [needFormOpen, setNeedFormOpen] = useState(true)
-  const [editingNeedId, setEditingNeedId] = useState<string | null>(null)
-  const [deletingNeedId, setDeletingNeedId] = useState<string | null>(null)
-  const [needFoodName, setNeedFoodName] = useState('')
   const [needForm, setNeedForm] = useState({
     category: 'Meals',
     required_quantity: '25',
@@ -5059,21 +3951,13 @@ function NgoDashboard({
   }
 
   const downloadVolunteerCertificate = async () => {
-    if (
-      !volunteerCertificateHtml
-      || !volunteerCertificateId
-      || certificateIssueDate === null
-      || certificateDeliveryCount === null
-    ) return
+    if (!volunteerCertificateHtml) return
     setCertificateDownloading(true)
     setCertificateError('')
     try {
-      await requestVolunteerCertificateDownload({
-        certificate_id: volunteerCertificateId,
-        recipient_name: user.full_name,
-        completed_deliveries: certificateDeliveryCount,
-        issue_date: certificateIssueDate,
-      })
+      if (!openCertificatePrintWindow(volunteerCertificateHtml, volunteerCertificateId)) {
+        throw new Error('Your browser blocked the certificate print window. Allow pop-ups to print or save this certificate.')
+      }
     } catch (error) {
       setCertificateError(error instanceof Error ? error.message : 'Unable to download the volunteer certificate PDF.')
     } finally {
@@ -5083,30 +3967,6 @@ function NgoDashboard({
 
   const handleRequestDonation = async (donation: Donation) => {
     if (submittingRequestIdsRef.current.has(donation.id)) return
-    const deliveryLocation = (requestDeliveryLocations[donation.id] || '').trim()
-    const schedule = requestSchedules[donation.id] || { priority: 'medium' as const, required_date: '', required_time: '' }
-    if (!deliveryLocation) {
-      setRequestFeedback((current) => ({
-        ...current,
-        [donation.id]: { type: 'error', text: 'Enter a delivery / drop-off location before requesting food.' },
-      }))
-      return
-    }
-    if (!schedule.required_date || !schedule.required_time) {
-      setRequestFeedback((current) => ({
-        ...current,
-        [donation.id]: { type: 'error', text: 'Enter the required date and time before requesting food.' },
-      }))
-      return
-    }
-    const requiredAt = new Date(`${schedule.required_date}T${schedule.required_time}`)
-    if (Number.isNaN(requiredAt.getTime()) || requiredAt.getTime() <= Date.now()) {
-      setRequestFeedback((current) => ({
-        ...current,
-        [donation.id]: { type: 'error', text: 'The required date and time must be in the future.' },
-      }))
-      return
-    }
     submittingRequestIdsRef.current.add(donation.id)
     setSubmittingRequestIds((current) => new Set(current).add(donation.id))
     setRequestFeedback((current) => {
@@ -5150,10 +4010,7 @@ function NgoDashboard({
           requested_quantity: requestedQuantity,
           quantity_unit: donation.quantity_unit,
           food_name: donation.food_name,
-          delivery_location: deliveryLocation,
-          priority: schedule.priority,
-          required_date: schedule.required_date,
-          required_time: schedule.required_time,
+          delivery_location: [user.address, user.city].filter(Boolean).join(', '),
           purpose: `Community support request for ${donation.food_name}`,
         }),
       })
@@ -5230,22 +4087,14 @@ function NgoDashboard({
   const handleCreateNeed = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     try {
-      const response = await apiRequest(
-        editingNeedId ? `/community-needs/${encodeURIComponent(editingNeedId)}` : '/community-needs',
-        {
-        method: editingNeedId ? 'PATCH' : 'POST',
+      await apiRequest('/community-needs', {
+        method: 'POST',
         body: JSON.stringify({
           ...needForm,
           required_quantity: Number(needForm.required_quantity),
-          description: `${needFoodName.trim()}\n\n${needForm.description.trim()}`,
         }),
       })
-      if (editingNeedId && response.need?.id !== editingNeedId) {
-        throw new Error('The server did not confirm that the existing community need was updated.')
-      }
-      setMessage(editingNeedId ? 'Community need updated successfully.' : 'Community need created successfully.')
-      setEditingNeedId(null)
-      setNeedFoodName('')
+      setMessage('Community need created successfully.')
       setNeedForm({
         category: 'Meals',
         required_quantity: '25',
@@ -5255,61 +4104,9 @@ function NgoDashboard({
         required_date: '',
         description: '',
       })
-      setNeedFormOpen(false)
       await onReload()
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to create need')
-    }
-  }
-
-  const cancelCreateNeed = () => {
-    setEditingNeedId(null)
-    setNeedFoodName('')
-    setNeedForm({
-      category: 'Meals',
-      required_quantity: '25',
-      location: '',
-      city: 'Coimbatore',
-      urgency: 'high',
-      required_date: '',
-      description: '',
-    })
-    setNeedFormOpen(false)
-  }
-
-  const editCommunityNeed = (need: CommunityNeed) => {
-    const [savedFoodName, ...savedDescription] = need.description.split(/\r?\n\r?\n/, 2)
-    const hasSavedFoodName = savedDescription.length > 0
-    setEditingNeedId(need.id)
-    setNeedFoodName(hasSavedFoodName ? savedFoodName : '')
-    setNeedForm({
-      category: need.category,
-      required_quantity: String(need.required_quantity),
-      location: need.location,
-      city: need.city,
-      urgency: need.urgency,
-      required_date: dateTimeInputValue(need.required_date),
-      description: hasSavedFoodName ? savedDescription[0] : need.description,
-    })
-    setMessage('')
-    setNeedFormOpen(true)
-    window.requestAnimationFrame(() => {
-      document.getElementById('community-need-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    })
-  }
-
-  const deleteCommunityNeed = async (need: CommunityNeed) => {
-    if (!window.confirm('Delete this community need and all responses and delivery records linked to it? This cannot be undone.')) return
-    setDeletingNeedId(need.id)
-    setMessage('')
-    try {
-      await apiRequest(`/community-needs/${encodeURIComponent(need.id)}`, { method: 'DELETE' })
-      setMessage('Community need and its linked records deleted.')
-      await onReload()
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to delete community need')
-    } finally {
-      setDeletingNeedId(null)
     }
   }
 
@@ -5372,36 +4169,6 @@ function NgoDashboard({
       await onReload()
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to update delivery issue')
-    }
-  }
-
-  const saveDeliveryIssueAction = async (issue: DeliveryIssue) => {
-    const actionTaken = issueActionDrafts[issue.id]
-      || (issue.action_taken === true ? 'yes' : issue.action_taken === false ? 'no' : '')
-    const actionNote = issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? ''
-    if (!actionTaken) {
-      setMessage('Select Yes or No for whether action was taken.')
-      return
-    }
-    if (actionTaken === 'yes' && !actionNote.trim()) {
-      setMessage('Describe the action taken before saving it.')
-      return
-    }
-    try {
-      await apiRequest(`/delivery-issues/${encodeURIComponent(issue.id)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          status: 'under_review',
-          action_taken: actionTaken === 'yes',
-          resolution_note: actionTaken === 'yes' ? actionNote.trim() : '',
-        }),
-      })
-      setIssueActionDrafts((current) => ({ ...current, [issue.id]: '' }))
-      setIssueActionNoteDrafts((current) => ({ ...current, [issue.id]: '' }))
-      setMessage('Issue action saved.')
-      await onReload()
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to save issue action')
     }
   }
 
@@ -5485,16 +4252,11 @@ function NgoDashboard({
   }
 
   const acceptDeliveryTask = async (taskId: string) => {
-    setAcceptingTaskId(taskId)
-    setMessage('')
     try {
-      await apiRequest(`/delivery-tasks/${encodeURIComponent(taskId)}/accept`, { method: 'POST' })
-      setMessage('Delivery task assigned and added to your active deliveries.')
+      await apiRequest(`/delivery-tasks/${taskId}/accept`, { method: 'POST' })
       await onReload()
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to accept delivery task')
-    } finally {
-      setAcceptingTaskId(null)
     }
   }
 
@@ -5547,25 +4309,6 @@ function NgoDashboard({
     ...Array.from({ length: ngoMonthDays }, (_, index) => index + 1),
   ]
   const selectedDateAvailability = filteredAvailability.filter((entry) => entry.date === selectedAvailabilityDate)
-  const requestHasExpiredDonation = (request: RequestItem) => Boolean(
-    request.donation_id && isFoodExpired(request.donation?.available_until),
-  )
-  const isHistoricalRequest = (request: RequestItem) => (
-    ['fulfilled', 'completed', 'cancelled', 'rejected'].includes(request.status)
-  )
-  const requestHistoryItems = requests.filter((request) => (
-    isHistoricalRequest(request) || !requestHasExpiredDonation(request)
-  ))
-  const coordinationRequests = requests
-    .filter((request) => !requestHasExpiredDonation(request))
-    .map((request) => ({
-      ...request,
-      contributions: request.contributions?.filter((contribution) => (
-        !isFoodExpired(contribution.available_until)
-        || ['delivered', 'cancelled', 'rejected'].includes(contribution.status)
-        || contribution.delivery_status === 'delivered'
-      )),
-    }))
 
   if (user.role === 'requester') {
     return (
@@ -5612,7 +4355,7 @@ function NgoDashboard({
               </select>
             </label>
             <label className="text-sm font-medium text-slate-700">
-              <span className="mb-1 flex items-center gap-1.5"><MapPin size={14} />Delivery / Drop-off Location</span>
+              <span className="mb-1 flex items-center gap-1.5"><MapPin size={14} />Delivery location</span>
               <input value={foodRequestForm.delivery_location} onChange={(event) => setFoodRequestForm((current) => ({ ...current, delivery_location: event.target.value }))} className="input-shell mt-1" placeholder="Full address and city" required />
             </label>
             <label className="text-sm font-medium text-slate-700">
@@ -5665,82 +4408,9 @@ function NgoDashboard({
                         <>
                     <p className="text-lg font-bold text-slate-900">{donation.food_name}</p>
                     <p className="mt-1 text-sm text-slate-600">{donation.quantity} {donation.quantity_unit} • {donation.city}</p>
-                    <p className={`mt-1 text-sm font-medium ${expiryToneClass(donation.available_until)}`}>Food expiry: {foodExpiryDateTime(donation.available_until)}</p>
+                    <p className="mt-1 text-sm font-medium text-amber-800">Food expiry: {foodExpiryDateTime(donation.available_until)}</p>
                     <p className="mt-1 text-sm text-slate-600">Pickup available until: {pickupDeadlineDateTime(donation.pickup_available_until)}</p>
-                    <p className="mt-2 text-xs text-slate-500">Pickup area: {donation.city || 'Shared after request approval'}</p>
-                    <label className="mt-3 block text-xs font-semibold text-slate-700">
-                      Delivery / Drop-off Location
-                      <input
-                        value={requestDeliveryLocations[donation.id] || ''}
-                        onChange={(event) => {
-                          setRequestDeliveryLocations((current) => ({ ...current, [donation.id]: event.target.value }))
-                          setRequestFeedback((current) => {
-                            const next = { ...current }
-                            delete next[donation.id]
-                            return next
-                          })
-                        }}
-                        className="input-shell mt-1"
-                        placeholder="Full address and city"
-                        required
-                      />
-                    </label>
-                    <div className="mt-3 grid gap-3 sm:grid-cols-3">
-                      <label className="text-xs font-semibold text-slate-700">
-                        Request Priority
-                        <select
-                          value={requestSchedules[donation.id]?.priority || 'medium'}
-                          onChange={(event) => setRequestSchedules((current) => ({
-                            ...current,
-                            [donation.id]: {
-                              ...(current[donation.id] || { priority: 'medium', required_date: '', required_time: '' }),
-                              priority: event.target.value as 'high' | 'medium' | 'low',
-                            },
-                          }))}
-                          className="input-shell mt-1"
-                          disabled={isSubmittingRequest}
-                        >
-                          <option value="high">High</option>
-                          <option value="medium">Medium</option>
-                          <option value="low">Low</option>
-                        </select>
-                      </label>
-                      <label className="text-xs font-semibold text-slate-700">
-                        Required Date
-                        <input
-                          type="date"
-                          min={localDateInputValue()}
-                          value={requestSchedules[donation.id]?.required_date || ''}
-                          onChange={(event) => setRequestSchedules((current) => ({
-                            ...current,
-                            [donation.id]: {
-                              ...(current[donation.id] || { priority: 'medium', required_date: '', required_time: '' }),
-                              required_date: event.target.value,
-                            },
-                          }))}
-                          className="input-shell mt-1"
-                          disabled={isSubmittingRequest}
-                          required
-                        />
-                      </label>
-                      <label className="text-xs font-semibold text-slate-700">
-                        Required Time
-                        <input
-                          type="time"
-                          value={requestSchedules[donation.id]?.required_time || ''}
-                          onChange={(event) => setRequestSchedules((current) => ({
-                            ...current,
-                            [donation.id]: {
-                              ...(current[donation.id] || { priority: 'medium', required_date: '', required_time: '' }),
-                              required_time: event.target.value,
-                            },
-                          }))}
-                          className="input-shell mt-1"
-                          disabled={isSubmittingRequest}
-                          required
-                        />
-                      </label>
-                    </div>
+                    <p className="mt-2 text-xs text-slate-500">Pickup: {donation.pickup_location}</p>
                     <label className="mt-3 block text-xs font-semibold text-slate-700">
                       Requested amount ({donation.quantity_unit})
                       <input type="number" min="0.01" step="any" max={availableQuantity} value={requestedValue} disabled={isSubmittingRequest} onChange={(event) => {
@@ -5779,9 +4449,9 @@ function NgoDashboard({
 
         <section id="requests" className="section-shell rounded-[28px] p-5">
           <h2 className="text-2xl font-bold text-slate-900">My request history</h2>
-          {requestHistoryItems.length ? (
+          {requests.length ? (
             <div className="mt-5 space-y-3">
-              {[...requestHistoryItems]
+              {[...requests]
                 .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
                 .map((request) => (
                 <article key={request.id} className={`rounded-2xl border p-4 ${request.priority === 'high' ? 'border-amber-300 bg-amber-50/40' : 'border-slate-200 bg-white'}`}>
@@ -5797,9 +4467,9 @@ function NgoDashboard({
                         <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] ${requestPriorityClass(request.priority)}`}>{request.priority || 'Priority not specified'}</span>
                         <span className="text-xs text-slate-600">Required by: {requiredDateTimeLabel(request.required_date, request.required_time)}</span>
                       </div>
-                      {request.donation && <p className={`mt-1 text-sm font-medium ${expiryToneClass(request.donation.available_until)}`}>Food expiry: {foodExpiryDateTime(request.donation.available_until)}</p>}
+                      {request.donation && <p className="mt-1 text-sm font-medium text-amber-800">Food expiry: {foodExpiryDateTime(request.donation.available_until)}</p>}
                       {request.donation && <p className="mt-1 text-sm text-slate-600">Pickup available until: {pickupDeadlineDateTime(request.donation.pickup_available_until)}</p>}
-                      <p className="mt-1 text-xs text-slate-500">Delivery / Drop-off Location: {request.delivery_location || 'Not provided'}</p>
+                      <p className="mt-1 text-xs text-slate-500">Delivery: {request.delivery_location || request.donation?.pickup_location || 'Coordinated by the donor'}</p>
                       </div>
                     </div>
                     <span className="rounded-full bg-[#edf8ef] px-3 py-1 text-xs font-semibold text-[#1d4d3d]">{formatRequestStatus(request.status)}</span>
@@ -5824,7 +4494,7 @@ function NgoDashboard({
                           <span className="inline-flex items-center gap-1"><MessageCircle size={14} />{feedback ? 'View feedback' : 'Give Feedback'}</span>
                         </button>}
                         {issue
-                          ? <Link to={`/delivery-issues/${encodeURIComponent(issue.id)}`} className="inline-flex items-center gap-1 text-xs font-semibold text-amber-900 underline"><Flag size={14} />Issue reported · {formatStatus(issue.status)} · View</Link>
+                          ? <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-900"><Flag size={14} />Issue reported · {formatStatus(issue.status)}</span>
                           : <button type="button" onClick={() => { setFeedbackDialogMode('issue'); setFeedbackDeliveryTaskId(task.id) }} className="secondary-btn inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold"><Flag size={14} />Report an Issue</button>}
                         {feedback && (
                           <div className="w-full rounded-lg border border-emerald-100 bg-white p-3 text-xs text-slate-700">
@@ -5975,9 +4645,9 @@ function NgoDashboard({
                       <MapIcon size={16} />
                       View Route
                     </a>
-                    <button type="button" onClick={() => void acceptDeliveryTask(task.id)} disabled={acceptingTaskId === task.id} className="primary-btn inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold disabled:opacity-60">
+                    <button type="button" onClick={() => acceptDeliveryTask(task.id)} className="primary-btn inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold">
                       <CheckCircle2 size={16} />
-                      {acceptingTaskId === task.id ? 'Assigning…' : 'Assign to Me'}
+                      Accept Task
                     </button>
                   </div>
                 </article>
@@ -6000,11 +4670,11 @@ function NgoDashboard({
                       <a href={`https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(task.pickup_location)}&destination=${encodeURIComponent(task.dropoff_location)}`} target="_blank" rel="noreferrer" className="mt-2 inline-flex text-sm font-semibold text-[#1d4d3d] underline">View Route</a>
                       </div>
                     </div>
-                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusToneClass(task.status)}`}>{formatStatus(task.status)}</span>
+                    <span className="rounded-full bg-[#edf8ef] px-3 py-1 text-xs font-semibold text-[#1d4d3d]">{formatStatus(task.status)}</span>
                   </div>
                   {task.status !== 'delivered' && (
                     task.status === 'assigned' ? (
-                      <button type="button" onClick={() => void acceptDeliveryTask(task.id)} disabled={acceptingTaskId === task.id} className="primary-btn mt-3 inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold disabled:opacity-60"><CheckCircle2 size={14} />{acceptingTaskId === task.id ? 'Assigning…' : 'Accept assigned delivery'}</button>
+                      <button type="button" onClick={() => acceptDeliveryTask(task.id)} className="primary-btn mt-3 inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold"><CheckCircle2 size={14} />Accept assigned delivery</button>
                     ) : task.status !== 'open' && (
                       <button type="button" onClick={() => advanceDeliveryTask(task)} className="primary-btn mt-3 inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold">
                         {task.status === 'accepted' ? <PackageCheck size={14} /> : task.status === 'picked_up' ? <Truck size={14} /> : <CheckCircle2 size={14} />}
@@ -6085,7 +4755,7 @@ function NgoDashboard({
             <div className="mt-4 flex flex-wrap gap-3">
               <button type="button" onClick={() => void generateCertificate(completedCount)} disabled={certificateGenerating} className="secondary-btn px-4 py-2 text-sm font-semibold disabled:cursor-wait disabled:opacity-60">{certificateGenerating ? 'Generating…' : 'Generate Certificate'}</button>
               <button type="button" onClick={() => setCertificatePreviewOpen(true)} disabled={!volunteerCertificateHtml} className="secondary-btn px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50">Preview</button>
-              <button type="button" onClick={() => void downloadVolunteerCertificate()} disabled={!volunteerCertificateHtml || certificateDownloading} className="primary-btn px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50">{certificateDownloading ? 'Preparing PDF…' : 'Download Certificate'}</button>
+              <button type="button" onClick={() => void downloadVolunteerCertificate()} disabled={!volunteerCertificateHtml || certificateDownloading} className="primary-btn px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50">{certificateDownloading ? 'Opening print…' : 'Download Certificate'}</button>
             </div>
           </div>
           <div className="section-shell rounded-[28px] p-5">
@@ -6116,7 +4786,7 @@ function NgoDashboard({
                   />
                 </div>
                 <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 p-4">
-                  <button type="button" onClick={() => void downloadVolunteerCertificate()} disabled={certificateDownloading} className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold disabled:opacity-60">{certificateDownloading ? <LoaderCircle className="animate-spin" size={15} /> : <Download size={15} />}{certificateDownloading ? 'Preparing PDF…' : 'Download PDF'}</button>
+                  <button type="button" onClick={() => void downloadVolunteerCertificate()} disabled={certificateDownloading} className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold disabled:opacity-60">{certificateDownloading ? <LoaderCircle className="animate-spin" size={15} /> : <Download size={15} />}{certificateDownloading ? 'Opening print…' : 'Download / Print PDF'}</button>
                   <button type="button" onClick={() => setCertificatePreviewOpen(false)} className="secondary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold"><X size={15} />Close</button>
                 </div>
               </div>
@@ -6281,9 +4951,9 @@ function NgoDashboard({
               ))}
             </div>
           )}
-          {coordinationRequests.length ? (
+          {requests.length ? (
             <div className="mt-5 space-y-3">
-              {[...coordinationRequests]
+              {[...requests]
                 .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
                 .map((request) => (
                 <div key={request.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -6306,9 +4976,9 @@ function NgoDashboard({
                         <span className="text-xs text-slate-600">Required by: {requiredDateTimeLabel(request.required_date, request.required_time)}</span>
                       </div>
                       {request.donation?.status && <p className="mt-1 text-xs text-slate-500">Donation status: {formatStatus(request.donation.status)}</p>}
-                      {request.donation && <p className={`mt-1 text-xs font-medium ${expiryToneClass(request.donation.available_until)}`}>Food expiry: {foodExpiryDateTime(request.donation.available_until)}</p>}
+                      {request.donation && <p className="mt-1 text-xs font-medium text-amber-800">Food expiry: {foodExpiryDateTime(request.donation.available_until)}</p>}
                       {request.donation && <p className="mt-1 text-xs text-slate-600">Pickup available until: {pickupDeadlineDateTime(request.donation.pickup_available_until)}</p>}
-                      <p className="mt-1 text-xs text-slate-500">Delivery / Drop-off Location: {request.delivery_location || 'Not provided'}</p>
+                      <p className="mt-1 text-xs text-slate-500">Delivery: {request.delivery_location || request.donation?.pickup_location || 'Existing donation destination'}</p>
                       </div>
                     </div>
                     <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-600">{formatRequestStatus(request.status)}</span>
@@ -6341,7 +5011,7 @@ function NgoDashboard({
                             <span className="text-xs font-medium text-slate-600">{contribution.delivery_status ? formatStatus(contribution.delivery_status) : formatStatus(contribution.status)}</span>
                           </div>
                           <p className="mt-1 text-xs text-slate-600">{contribution.food_name} · Pickup: {contribution.pickup_location || 'Not provided'}</p>
-                          <p className={`mt-1 text-xs font-medium ${expiryToneClass(contribution.available_until)}`}>Food expiry: {foodExpiryDateTime(contribution.available_until)}</p>
+                          <p className="mt-1 text-xs font-medium text-amber-800">Food expiry: {foodExpiryDateTime(contribution.available_until)}</p>
                           <p className="mt-1 text-xs text-slate-600">Pickup available until: {pickupDeadlineDateTime(contribution.pickup_available_until)}</p>
                           {contribution.volunteer_name && <p className="mt-1 text-xs text-slate-600">Volunteer: {contribution.volunteer_name}</p>}
                           {contribution.status === 'committed' && !contribution.delivery_task_id && (
@@ -6375,29 +5045,16 @@ function NgoDashboard({
         <form onSubmit={createDeliveryTask} className="mt-4 grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 md:grid-cols-2">
           <label className="text-sm font-medium text-slate-700">
             Approved request
-            <select value={taskForm.request_id} onChange={(event) => {
-              const selectedRequest = requests.find((request) => request.id === event.target.value)
-              setTaskForm((current) => ({
-                ...current,
-                request_id: event.target.value,
-                dropoff_location: selectedRequest?.delivery_location || '',
-              }))
-            }} className="input-shell mt-2" required>
+            <select value={taskForm.request_id} onChange={(event) => setTaskForm((current) => ({ ...current, request_id: event.target.value }))} className="input-shell mt-2" required>
               <option value="">Select a request</option>
-              {coordinationRequests.filter((item) => item.status === 'approved' && (item.coordinating_ngo_id === user.id || (!item.requester_id && item.ngo_id === user.id)) && !deliveryTasks.some((task) => task.request_id === item.id && task.status !== 'delivered')).map((item) => (
+              {requests.filter((item) => item.status === 'approved' && (item.coordinating_ngo_id === user.id || (!item.requester_id && item.ngo_id === user.id)) && !deliveryTasks.some((task) => task.request_id === item.id && task.status !== 'delivered')).map((item) => (
                 <option key={item.id} value={item.id}>{item.donation?.food_name || item.purpose} · {item.requested_quantity}</option>
               ))}
             </select>
           </label>
           <label className="text-sm font-medium text-slate-700">
-            Delivery / Drop-off Location
-            <input
-              value={taskForm.dropoff_location}
-              onChange={(event) => setTaskForm((current) => ({ ...current, dropoff_location: event.target.value }))}
-              className="input-shell mt-2"
-              readOnly={Boolean(requests.find((request) => request.id === taskForm.request_id)?.requester_id)}
-              required
-            />
+            Drop-off location
+            <input value={taskForm.dropoff_location} onChange={(event) => setTaskForm((current) => ({ ...current, dropoff_location: event.target.value }))} className="input-shell mt-2" required />
           </label>
           <label className="text-sm font-medium text-slate-700 md:col-span-2">
             Drop-off instructions
@@ -6419,7 +5076,7 @@ function NgoDashboard({
                     {task.status === 'delivered' ? 'Delivered' : 'Updated'}: {new Date(task.updated_at).toLocaleString()}
                   </p>
                 </div>
-                <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusToneClass(task.status)}`}>{formatStatus(task.status)}</span>
+                <span className="rounded-full bg-[#edf8ef] px-3 py-1 text-xs font-semibold text-[#1d4d3d]">{formatStatus(task.status)}</span>
               </div>
             </article>
           ))}
@@ -6445,7 +5102,7 @@ function NgoDashboard({
                     {task.volunteer_name && <p className="mt-1 flex items-center gap-1 text-xs text-slate-600"><Truck size={14} />Volunteer: {task.volunteer_name}</p>}
                     <p className="mt-1 flex items-center gap-1 text-xs text-slate-500"><CalendarClock size={14} />Submitted: {feedback.created_at ? new Date(feedback.created_at).toLocaleString() : 'Date not recorded'}</p>
                   </div>
-                  <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusToneClass(task.status)}`}>{formatStatus(task.status)}</span>
+                  <span className="rounded-full bg-[#edf8ef] px-3 py-1 text-xs font-semibold text-[#1d4d3d]">{formatStatus(task.status)}</span>
                 </div>
                 <details className="mt-3 rounded-xl bg-slate-50 p-3 text-sm">
                   <summary className="cursor-pointer font-semibold text-slate-700">Food quality and delivery feedback</summary>
@@ -6456,89 +5113,30 @@ function NgoDashboard({
                 </details>
               </article>
             )))}
-            {deliveryTasks.flatMap((task) => (task.issues || []).map((issue) => {
-              const actionTaken = issueActionDrafts[issue.id]
-                || (issue.action_taken === true ? 'yes' : issue.action_taken === false ? 'no' : '')
-              return (
+            {deliveryTasks.flatMap((task) => (task.issues || []).map((issue) => (
               <article key={issue.id} className="rounded-2xl border border-amber-200 bg-amber-50/40 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <Link to={`/delivery-issues/${encodeURIComponent(issue.id)}`} className="font-semibold text-slate-900 underline">Reported delivery issue · {task.receiver_name || 'Food receiver'} · View</Link>
+                    <p className="font-semibold text-slate-900">Reported delivery issue · {task.receiver_name || 'Food receiver'}</p>
                     <p className="mt-1 text-xs text-slate-600">Request: {issue.request_id || task.request_id || 'Not linked'} · Delivery: {issue.delivery_id || task.id}</p>
                     <p className="mt-1 text-xs text-slate-500">Submitted: {new Date(issue.created_at).toLocaleString()}</p>
                     <p className="mt-2 text-sm text-slate-700">{issue.description}</p>
-                    {issue.action_taken === true && issue.resolution_note && <p className="mt-2 text-sm text-slate-600">Action taken: {issue.resolution_note}</p>}
                   </div>
-                  <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusToneClass(issue.status)}`}>{formatStatus(issue.status)}</span>
+                  <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-amber-900">{formatStatus(issue.status)}</span>
                 </div>
                 <div className="mt-3 flex flex-wrap items-end gap-2">
                   <label className="text-xs font-semibold text-slate-700">
                     Issue status
                     <select value={issueStatusDrafts[issue.id] || issue.status} onChange={(event) => setIssueStatusDrafts((current) => ({ ...current, [issue.id]: event.target.value as DeliveryIssue['status'] }))} className="input-shell mt-1">
-                      <option value={issue.status}>{formatStatus(issue.status)}</option>
-                      {issue.status === 'reported' && <option value="under_review">Under Review</option>}
-                      {issue.status === 'open' && <option value="under_review">Under Review</option>}
-                      {issue.status === 'under_review'
-                        && issue.action_taken === true
-                        && actionTaken !== 'no'
-                        && issue.resolution_note?.trim()
-                        && (actionTaken !== 'yes' || (issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? '').trim())
-                        && <option value="resolved">Resolved</option>}
+                      <option value="open">Open</option>
+                      <option value="under_review">Under Review</option>
+                      <option value="resolved">Resolved</option>
                     </select>
                   </label>
                   <button type="button" onClick={() => void updateDeliveryIssueStatus(issue)} disabled={(issueStatusDrafts[issue.id] || issue.status) === issue.status} className="primary-btn inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold disabled:opacity-50"><Save size={13} />Save status</button>
                 </div>
-                {issue.status === 'under_review' && (
-                  <div className="mt-3 space-y-3 rounded-xl border border-slate-200 bg-white p-3">
-                    <label className="block text-xs font-semibold text-slate-700">
-                      Was any action taken?
-                      <select
-                        value={actionTaken}
-                        onChange={(event) => {
-                          const action = event.target.value as '' | 'yes' | 'no'
-                          setIssueActionDrafts((current) => ({ ...current, [issue.id]: action }))
-                          if (action) setIssueStatusDrafts((current) => ({ ...current, [issue.id]: 'under_review' }))
-                        }}
-                        className="input-shell mt-1"
-                      >
-                        <option value="">Select Yes or No</option>
-                        <option value="yes">Yes</option>
-                        <option value="no">No</option>
-                      </select>
-                    </label>
-                    {actionTaken === 'yes' && (
-                      <label className="block text-xs font-semibold text-slate-700">
-                        What action was taken?
-                        <textarea
-                          value={issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? ''}
-                          onChange={(event) => {
-                            setIssueActionNoteDrafts((current) => ({ ...current, [issue.id]: event.target.value }))
-                            if (!event.target.value.trim()) setIssueStatusDrafts((current) => ({ ...current, [issue.id]: 'under_review' }))
-                          }}
-                          maxLength={2000}
-                          className="input-shell mt-1 min-h-20"
-                          placeholder="Describe the action taken for the receiver."
-                        />
-                      </label>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => void saveDeliveryIssueAction(issue)}
-                      disabled={
-                        !actionTaken
-                        || (actionTaken === 'yes' && !(issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? '').trim())
-                        || (actionTaken === 'yes' && issue.action_taken === true && (issueActionNoteDrafts[issue.id] ?? issue.resolution_note ?? '').trim() === (issue.resolution_note || '').trim())
-                        || (actionTaken === 'no' && issue.action_taken === false && !issue.resolution_note)
-                      }
-                      className="primary-btn inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <Save size={13} />Save action
-                    </button>
-                  </div>
-                )}
               </article>
-              )
-            }))}
+            )))}
           </div>
         ) : (
           <p className="mt-3 text-sm text-slate-500">No delivery feedback or reported issues have been submitted yet.</p>
@@ -6570,72 +5168,54 @@ function NgoDashboard({
       <section id="needs" className="section-shell rounded-[28px] p-5">
         <div className="mb-5 flex items-center justify-between">
           <h2 className="text-2xl font-bold text-slate-900">Community food needs</h2>
-          <div className="flex items-center gap-3">
-            <span className="rounded-full bg-[#edf8ef] px-2.5 py-1 text-xs font-semibold text-[#1d4d3d]">{needs.length} active</span>
-            {!needFormOpen && (
-              <button type="button" onClick={() => setNeedFormOpen(true)} className="primary-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold">
-                <Plus size={16} />Create Need
-              </button>
-            )}
-          </div>
+          <span className="rounded-full bg-[#edf8ef] px-2.5 py-1 text-xs font-semibold text-[#1d4d3d]">{needs.length} active</span>
         </div>
 
-        {needFormOpen && (
-          <form id="community-need-form" onSubmit={handleCreateNeed} className="mt-5 grid w-full max-w-5xl gap-4 md:grid-cols-2">
-            <div className="md:col-span-2">
-              <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><Utensils size={15} />Food Name</label>
-              <input value={needFoodName} onChange={(event) => setNeedFoodName(event.target.value)} className="input-shell" placeholder="Enter a food name" required />
-            </div>
-            <div>
-              <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><Package size={15} />Food Category</label>
-              <select value={needForm.category} onChange={(event) => setNeedForm((current) => ({ ...current, category: event.target.value }))} className="input-shell">
-                <option>Meals</option>
-                <option>Snacks</option>
-                <option>Fruits</option>
-                <option>Vegetables</option>
-              </select>
-            </div>
-            <div>
-              <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><Package size={15} />Required Quantity</label>
-              <input type="number" min="1" value={needForm.required_quantity} onChange={(event) => setNeedForm((current) => ({ ...current, required_quantity: event.target.value }))} className="input-shell" required />
-            </div>
-            <div className="md:col-span-2">
-              <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><MapPin size={15} />Location / Delivery Location</label>
-              <input value={needForm.location} onChange={(event) => setNeedForm((current) => ({ ...current, location: event.target.value }))} className="input-shell" placeholder="Shivaji Nagar" required />
-            </div>
-            <div>
-              <label className="mb-2 block text-sm font-medium text-slate-700">City</label>
-              <input value={needForm.city} onChange={(event) => setNeedForm((current) => ({ ...current, city: event.target.value }))} className="input-shell" />
-            </div>
-            <div>
-              <label className="mb-2 block text-sm font-medium text-slate-700">Urgency</label>
-              <select value={needForm.urgency} onChange={(event) => setNeedForm((current) => ({ ...current, urgency: event.target.value }))} className="input-shell">
-                <option value="high">High</option>
-                <option value="medium">Medium</option>
-                <option value="low">Low</option>
-              </select>
-            </div>
-            <div>
-              <label className="mb-2 flex items-center gap-2 text-sm font-medium text-slate-700"><CalendarDays size={15} />Required Date</label>
-              <input type="datetime-local" value={needForm.required_date} onChange={(event) => setNeedForm((current) => ({ ...current, required_date: event.target.value }))} className="input-shell" required />
-            </div>
-            <div className="md:col-span-2">
-              <label className="mb-2 block text-sm font-medium text-slate-700">Description</label>
-              <textarea value={needForm.description} onChange={(event) => setNeedForm((current) => ({ ...current, description: event.target.value }))} className="input-shell min-h-[100px]" placeholder="Describe who needs support and any distribution details." required />
-            </div>
+        <form onSubmit={handleCreateNeed} className="grid gap-4 rounded-3xl border border-slate-200 bg-slate-50 p-4 md:grid-cols-2">
+          <div>
+            <label className="mb-2 block text-sm font-medium text-slate-700">Category</label>
+            <select value={needForm.category} onChange={(event) => setNeedForm((current) => ({ ...current, category: event.target.value }))} className="input-shell">
+              <option>Meals</option>
+              <option>Snacks</option>
+              <option>Fruits</option>
+              <option>Vegetables</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-2 block text-sm font-medium text-slate-700">Required quantity</label>
+            <input type="number" min="1" value={needForm.required_quantity} onChange={(event) => setNeedForm((current) => ({ ...current, required_quantity: event.target.value }))} className="input-shell" />
+          </div>
+          <div>
+            <label className="mb-2 block text-sm font-medium text-slate-700">Location</label>
+            <input value={needForm.location} onChange={(event) => setNeedForm((current) => ({ ...current, location: event.target.value }))} className="input-shell" placeholder="Shivaji Nagar" required />
+          </div>
+          <div>
+            <label className="mb-2 block text-sm font-medium text-slate-700">Urgency</label>
+            <select value={needForm.urgency} onChange={(event) => setNeedForm((current) => ({ ...current, urgency: event.target.value }))} className="input-shell">
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-2 block text-sm font-medium text-slate-700">Required date</label>
+            <input type="datetime-local" value={needForm.required_date} onChange={(event) => setNeedForm((current) => ({ ...current, required_date: event.target.value }))} className="input-shell" required />
+          </div>
+          <div>
+            <label className="mb-2 block text-sm font-medium text-slate-700">City</label>
+            <input value={needForm.city} onChange={(event) => setNeedForm((current) => ({ ...current, city: event.target.value }))} className="input-shell" />
+          </div>
+          <div className="md:col-span-2">
+            <label className="mb-2 block text-sm font-medium text-slate-700">Description</label>
+            <textarea value={needForm.description} onChange={(event) => setNeedForm((current) => ({ ...current, description: event.target.value }))} className="input-shell min-h-[90px]" placeholder="Families in need of warm meals during the evening distribution." required />
+          </div>
 
-            {message && <div className={`md:col-span-2 rounded-2xl border px-4 py-3 text-sm ${/successfully|created/i.test(message) ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-red-200 bg-red-50 text-red-700'}`} role={/successfully|created/i.test(message) ? 'status' : 'alert'}>{message}</div>}
+          {message && <div className="md:col-span-2 rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{message}</div>}
 
-            <div className="md:col-span-2 flex justify-end gap-3">
-              <button type="button" onClick={cancelCreateNeed} className="secondary-btn inline-flex items-center gap-2 px-5 py-3 text-sm font-semibold">
-                <X size={16} />{editingNeedId ? 'Cancel edit' : 'Cancel'}
-              </button>
-              <button type="submit" className="primary-btn inline-flex items-center gap-2 px-5 py-3 text-sm font-semibold">
-                {editingNeedId ? <Save size={16} /> : <Plus size={16} />}{editingNeedId ? 'Save Changes' : 'Create Need'}
-              </button>
-            </div>
-          </form>
-        )}
+          <div className="md:col-span-2 flex justify-end">
+            <button type="submit" className="primary-btn inline-flex items-center gap-2 px-5 py-3 text-sm font-semibold"><Plus size={16} />Create need</button>
+          </div>
+        </form>
 
         {needs.length ? (
           <div className="mt-5 grid gap-4 md:grid-cols-2">
@@ -6708,21 +5288,6 @@ function NgoDashboard({
                     ))}
                   </div>
                 ) : <p className="mt-3 text-xs text-slate-500">No donor responses yet.</p>}
-                <div className="mt-4 border-t border-slate-100 pt-3">
-                  <div className="flex flex-wrap gap-2">
-                    <button type="button" onClick={() => editCommunityNeed(need)} className="secondary-btn inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold">
-                      <Pencil size={14} />Edit
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void deleteCommunityNeed(need)}
-                      disabled={deletingNeedId === need.id}
-                      className="secondary-btn inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <Trash2 size={14} />{deletingNeedId === need.id ? 'Deleting…' : 'Delete'}
-                    </button>
-                  </div>
-                </div>
               </div>
             ))}
           </div>
