@@ -3377,6 +3377,7 @@ function ForgotPasswordPage() {
 
 function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; onLogout: () => void; onUserUpdate: (user: SessionUser) => void }) {
   const [overview, setOverview] = useState<DashboardSummary | null>(null)
+  const [feedbackVisibilityDay, setFeedbackVisibilityDay] = useState(() => new Date())
   const [donations, setDonations] = useState<Donation[]>([])
   const [requests, setRequests] = useState<RequestItem[]>([])
   const [deliveryTasks, setDeliveryTasks] = useState<DeliveryTask[]>([])
@@ -3392,6 +3393,20 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
   const notificationAnchorRef = useRef<HTMLButtonElement>(null)
   const notificationPanelRef = useRef<HTMLDivElement>(null)
   const [notificationPosition, setNotificationPosition] = useState({ top: 0, right: 16 })
+
+  useEffect(() => {
+    let timeoutId: number
+    const scheduleNextLocalDay = () => {
+      const now = new Date()
+      const nextLocalDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+      timeoutId = window.setTimeout(() => {
+        setFeedbackVisibilityDay(new Date())
+        scheduleNextLocalDay()
+      }, nextLocalDay.getTime() - now.getTime() + 10)
+    }
+    scheduleNextLocalDay()
+    return () => window.clearTimeout(timeoutId)
+  }, [])
 
   const loadData = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -3745,6 +3760,7 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
               donations={donations}
               requests={requests}
               needs={needs}
+              feedbackVisibilityDay={feedbackVisibilityDay}
               deliveryIssues={deliveryIssues}
               onReload={reloadDashboardData}
               onDonationCreated={(donation) => setDonations((current) => (
@@ -3773,7 +3789,7 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
   )
 }
 
-function DonorDashboard({ user, overview, donations, requests, needs, deliveryIssues, onReload, onDonationCreated }: { user: SessionUser; overview: DashboardSummary | null; donations: Donation[]; requests: RequestItem[]; needs: CommunityNeed[]; deliveryIssues: DeliveryIssue[]; onReload: () => Promise<void>; onDonationCreated: (donation: Donation) => void }) {
+function DonorDashboard({ user, overview, donations, requests, needs, feedbackVisibilityDay, deliveryIssues, onReload, onDonationCreated }: { user: SessionUser; overview: DashboardSummary | null; donations: Donation[]; requests: RequestItem[]; needs: CommunityNeed[]; feedbackVisibilityDay: Date; deliveryIssues: DeliveryIssue[]; onReload: () => Promise<void>; onDonationCreated: (donation: Donation) => void }) {
   const [message, setMessage] = useState('')
   const [editingDonationId, setEditingDonationId] = useState<string | null>(null)
   const [imageUploading, setImageUploading] = useState(false)
@@ -3926,12 +3942,13 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
     isHistoricalDonationStatus(donation.status) || isDonationCurrent(donation)
   ))
   const isExpiredActiveRequest = (request: RequestItem) => (
-    !isHistoricalRequestStatus(request.status)
-    && (
-      dateTimeHasPassed(request.required_date, request.required_time)
-      || isFoodExpired(request.donation?.available_until)
-      || isPickupExpired(request.donation?.pickup_available_until)
-    )
+    dateTimeHasPassed(request.required_date, request.required_time)
+    || isFoodExpired(request.donation?.available_until)
+    || isPickupExpired(request.donation?.pickup_available_until)
+    || Boolean(request.contributions?.some((contribution) => (
+      isFoodExpired(contribution.available_until)
+      || isPickupExpired(contribution.pickup_available_until)
+    )))
   )
   const supplierRequests = requests.filter((request) => !request.multi_contribution && request.donation_id && donorDonationIds.has(request.donation_id))
   const visibleSupplierRequests = supplierRequests.filter((request) => !isExpiredActiveRequest(request))
@@ -4691,10 +4708,14 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
                           <p className="text-xs text-slate-500">{donation.category}</p>
                           <p className={`mt-1 text-xs font-medium ${expiryToneClass(donation.available_until)}`}>Food expiry: {foodExpiryDateTime(donation.available_until)}</p>
                           <p className="mt-1 text-xs text-slate-600">Pickup available until: {pickupDeadlineDateTime(donation.pickup_available_until)}</p>
-                          {donation.feedback?.length ? (
+                          {donation.feedback?.some((feedback) => (
+                            isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackVisibilityDay)
+                          )) ? (
                             <div className="mt-2 space-y-2 rounded-lg bg-emerald-50 p-2 text-xs text-emerald-900">
                               <p className="flex items-center gap-1 font-semibold"><HandHeart size={15} />Receiver appreciation</p>
-                              {donation.feedback.map((feedback) => (
+                              {donation.feedback.filter((feedback) => (
+                                isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackVisibilityDay)
+                              )).map((feedback) => (
                                 <div key={feedback.id} className="border-t border-emerald-100 pt-2">
                                   <p className="flex items-center gap-1 font-medium" aria-label={`Rating ${feedback.rating} out of 5`}>
                                     {Array.from({ length: 5 }, (_, index) => <Star key={index} size={14} className={index < feedback.rating ? 'fill-amber-400 text-amber-500' : 'text-slate-300'} />)}
@@ -4748,7 +4769,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
       <section id="requests" className="section-shell rounded-[28px] p-5">
         <div className="mb-5 flex items-center justify-between">
           <h2 className="text-2xl font-bold text-slate-900">Donation requests</h2>
-          <span className="rounded-full bg-[#eff6ff] px-2.5 py-1 text-xs font-semibold text-[#1d4ed8]">{supplierRequests.filter((request) => !['completed', 'fulfilled', 'rejected', 'cancelled'].includes(request.status)).length} active requests</span>
+          <span className="rounded-full bg-[#eff6ff] px-2.5 py-1 text-xs font-semibold text-[#1d4ed8]">{visibleSupplierRequests.filter((request) => !['completed', 'fulfilled', 'rejected', 'cancelled'].includes(request.status)).length} active requests</span>
         </div>
 
         {visibleSupplierRequests.length ? (
@@ -4934,7 +4955,7 @@ function NgoDashboard({
   onReload: () => Promise<void>
   onUserUpdate: (user: SessionUser) => void
 }) {
-  const [feedbackVisibilityDay, setFeedbackVisibilityDay] = useState(() => new Date())
+  const feedbackListLocalDay = new Date()
   const [message, setMessage] = useState('')
   const [acceptingTaskId, setAcceptingTaskId] = useState<string | null>(null)
   const [issueStatusDrafts, setIssueStatusDrafts] = useState<Record<string, DeliveryIssue['status']>>({})
@@ -4953,19 +4974,6 @@ function NgoDashboard({
   const [submittingRequestIds, setSubmittingRequestIds] = useState<Set<string>>(() => new Set())
   const [requestFeedback, setRequestFeedback] = useState<Record<string, { type: 'success' | 'error'; text: string }>>({})
   const submittingRequestIdsRef = useRef(new Set<string>())
-  useEffect(() => {
-    let timeoutId: number
-    const scheduleNextLocalDay = () => {
-      const now = new Date()
-      const nextLocalDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
-      timeoutId = window.setTimeout(() => {
-        setFeedbackVisibilityDay(new Date())
-        scheduleNextLocalDay()
-      }, nextLocalDay.getTime() - now.getTime() + 10)
-    }
-    scheduleNextLocalDay()
-    return () => window.clearTimeout(timeoutId)
-  }, [])
 
   const [foodRequestForm, setFoodRequestForm] = useState({
     food_name: '',
@@ -5637,24 +5645,20 @@ function NgoDashboard({
     ...Array.from({ length: ngoMonthDays }, (_, index) => index + 1),
   ]
   const selectedDateAvailability = filteredAvailability.filter((entry) => entry.date === selectedAvailabilityDate)
-  const requestHasExpiredDonation = (request: RequestItem) => Boolean(
+  const requestHasExpiredFood = (request: RequestItem) => (
     dateTimeHasPassed(request.required_date, request.required_time)
-    || (
-      request.donation_id
-      && (
-        isFoodExpired(request.donation?.available_until)
-        || isPickupExpired(request.donation?.pickup_available_until)
-      )
-    ),
+    || isFoodExpired(request.donation?.available_until)
+    || isPickupExpired(request.donation?.pickup_available_until)
+    || Boolean(request.contributions?.some((contribution) => (
+      isFoodExpired(contribution.available_until)
+      || isPickupExpired(contribution.pickup_available_until)
+    )))
   )
-  const isHistoricalRequest = (request: RequestItem) => (
-    isHistoricalRequestStatus(request.status)
-  )
-  const requestHistoryItems = requests.filter((request) => (
-    isHistoricalRequest(request) || !requestHasExpiredDonation(request)
+  const displayedRequestHistory = requests.filter((request) => (
+    !requestHasExpiredFood(request)
   ))
   const coordinationRequests = requests
-    .filter((request) => isHistoricalRequest(request) || !requestHasExpiredDonation(request))
+    .filter((request) => !requestHasExpiredFood(request))
     .map((request) => ({
       ...request,
       contributions: request.contributions?.filter((contribution) => (
@@ -5877,9 +5881,9 @@ function NgoDashboard({
 
         <section id="requests" className="section-shell rounded-[28px] p-5">
           <h2 className="text-2xl font-bold text-slate-900">My request history</h2>
-          {requestHistoryItems.length ? (
+          {displayedRequestHistory.length ? (
             <div className="mt-5 space-y-3">
-              {[...requestHistoryItems]
+              {[...displayedRequestHistory]
                 .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
                 .map((request) => (
                 <article key={request.id} className={`rounded-2xl border p-4 ${request.priority === 'high' ? 'border-amber-300 bg-amber-50/40' : 'border-slate-200 bg-white'}`}>
@@ -5908,7 +5912,9 @@ function NgoDashboard({
                     ))}
                   </ol>
                   {request.delivery_tasks?.filter((task) => task.status === 'delivered').map((task) => {
-                    const feedback = task.feedback?.[0]
+                    const feedback = task.feedback?.find((entry) => (
+                      isFeedbackSubmittedOnLocalDay(entry.created_at, feedbackListLocalDay)
+                    ))
                     const issue = task.issues?.[0]
                     return (
                       <div key={task.id} className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-slate-50 p-3">
@@ -6119,10 +6125,14 @@ function NgoDashboard({
                   ) : (
                     <button type="button" onClick={() => startRouteEdit(task)} className="secondary-btn mt-3 inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold"><Pencil size={14} />Edit addresses</button>
                   )}
-                  {task.feedback?.length ? (
+                  {task.feedback?.some((feedback) => (
+                    isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackListLocalDay)
+                  )) ? (
                     <div className="mt-4 space-y-2 border-t border-slate-100 pt-3">
                       <p className="text-xs font-bold uppercase tracking-wide text-slate-500">Receiver / organization feedback</p>
-                      {task.feedback.map((feedback) => (
+                      {task.feedback.filter((feedback) => (
+                        isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackListLocalDay)
+                      )).map((feedback) => (
                         <div key={feedback.id} className="rounded-xl bg-[#f4f7f1] p-3 text-sm">
                           <p className="flex flex-wrap items-center gap-2 font-semibold text-slate-800">
                             <span>{feedback.author_name || 'Food receiver'}</span>
@@ -6528,13 +6538,15 @@ function NgoDashboard({
       <section id="delivery-feedback" className="section-shell rounded-[28px] p-5">
         <h2 className="flex items-center gap-2 text-2xl font-bold text-slate-900"><ClipboardList size={22} className="text-[#1d4d3d]" />Delivery Feedback &amp; Issues</h2>
         {deliveryTasks.some((task) => (
-          task.feedback?.some((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackVisibilityDay))
-          || task.issues?.length
+          task.feedback?.some((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackListLocalDay))
+          || task.issues?.some((issue) => isFeedbackSubmittedOnLocalDay(issue.created_at, feedbackListLocalDay))
         )) ? (
           <div className="mt-4 space-y-3">
-            {deliveryTasks.flatMap((task) => (task.feedback || [])
-              .filter((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackVisibilityDay))
-              .map((feedback) => (
+            {deliveryTasks.flatMap((task) => (
+              (task.feedback || [])
+                .filter((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackListLocalDay))
+                .map((feedback) => ({ task, feedback }))
+            )).map(({ task, feedback }) => (
               <article key={feedback.id} className="rounded-2xl border border-slate-200 bg-white p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
@@ -6558,11 +6570,14 @@ function NgoDashboard({
                   {(feedback.comments || feedback.comment) && <p className="mt-1 whitespace-pre-wrap text-slate-600"><span className="font-medium">Comments:</span> {feedback.comments || feedback.comment}</p>}
                 </details>
               </article>
-            )))}
-            {deliveryTasks.flatMap((task) => (task.issues || []).map((issue) => {
-              const actionTaken = issueActionDrafts[issue.id]
-                || (issue.action_taken === true ? 'yes' : issue.action_taken === false ? 'no' : '')
-              return (
+            ))}
+            {deliveryTasks.flatMap((task) => (
+              (task.issues || [])
+                .filter((issue) => isFeedbackSubmittedOnLocalDay(issue.created_at, feedbackListLocalDay))
+                .map((issue) => {
+                  const actionTaken = issueActionDrafts[issue.id]
+                    || (issue.action_taken === true ? 'yes' : issue.action_taken === false ? 'no' : '')
+                  return (
               <article key={issue.id} className="rounded-2xl border border-amber-200 bg-amber-50/40 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
@@ -6636,8 +6651,9 @@ function NgoDashboard({
                   </div>
                 )}
               </article>
-              )
-            }))}
+                  )
+                })
+            ))}
           </div>
         ) : (
           <p className="mt-3 text-sm text-slate-500">No delivery feedback or reported issues have been submitted yet.</p>
