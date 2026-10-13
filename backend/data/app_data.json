@@ -299,6 +299,105 @@
       "link": "/dashboard",
       "read_at": null,
       "created_at": "2026-10-08T04:52:41.666055+00:00"
+    },
+    {
+      "id": "notify-dca3ef57",
+      "user_id": "user-978d2c6d",
+      "message": "Donation created successfully: rice.",
+      "type": "donation",
+      "link": "/donor",
+      "read_at": null,
+      "created_at": "2026-10-13T01:33:30.894921+00:00"
+    },
+    {
+      "id": "notify-7dc696f8",
+      "user_id": "user-03046c7f",
+      "message": "Your request for 10.0 packets of rice was posted.",
+      "type": "request",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:34:30.983900+00:00"
+    },
+    {
+      "id": "notify-bfd88ddc",
+      "user_id": "user-978d2c6d",
+      "message": "srinithi requested 15.0 packets of rice.",
+      "type": "request",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:36:16.582522+00:00"
+    },
+    {
+      "id": "notify-a21e611bd94d48a4866f78028df10bd9",
+      "user_id": "user-03046c7f",
+      "message": "Your food request was approved.",
+      "type": "approval",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:38:18.083744+00:00"
+    },
+    {
+      "id": "notify-5b1d3efd",
+      "user_id": "user-03046c7f",
+      "message": "A delivery task is being coordinated for rice.",
+      "type": "delivery",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:38:23.897596+00:00"
+    },
+    {
+      "id": "notify-4c790f01",
+      "user_id": "user-a92e2c7f",
+      "message": "sandhya was assigned a delivery task.",
+      "type": "delivery",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:38:59.077359+00:00"
+    },
+    {
+      "id": "notify-a0edd869",
+      "user_id": "user-a92e2c7f",
+      "message": "sandhya accepted a delivery task.",
+      "type": "delivery",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:39:00.787256+00:00"
+    },
+    {
+      "id": "notify-9c11ae78",
+      "user_id": "user-03046c7f",
+      "message": "Your food request has been fulfilled.",
+      "type": "delivery",
+      "link": "/delivery-feedback/delivery-73abc0387b",
+      "read_at": null,
+      "created_at": "2026-10-13T01:39:01.843624+00:00"
+    },
+    {
+      "id": "notify-561a7445",
+      "user_id": "user-a92e2c7f",
+      "message": "A delivery issue was reported for request request-a19ecce449f4413faf937c19a31e78ac (delivery delivery-73abc0387b).",
+      "type": "delivery_issue",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:39:34.228287+00:00"
+    },
+    {
+      "id": "notify-85a5f006",
+      "user_id": "user-03046c7f",
+      "message": "Your delivery issue for delivery delivery-73abc0387b is now under review.",
+      "type": "delivery_issue",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:40:03.896049+00:00"
+    },
+    {
+      "id": "notify-0759ac02",
+      "user_id": "user-03046c7f",
+      "message": "Your delivery issue for delivery delivery-73abc0387b is now resolved.",
+      "type": "delivery_issue",
+      "link": "/dashboard",
+      "read_at": null,
+      "created_at": "2026-10-13T01:40:09.659900+00:00"
     }
   ],
   "donations": [
@@ -324,9 +423,35 @@
       "handling_instructions": "",
       "contact_name": "sanjay",
       "contact_phone": "",
-      "status": "available",
+      "status": "expired",
       "created_at": "2026-10-08T04:21:38.536699+00:00",
-      "updated_at": "2026-10-08T04:29:21.715638+00:00"
+      "updated_at": "2026-10-13T01:34:30.952023+00:00"
+    },
+    {
+      "id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "donor_id": "user-978d2c6d",
+      "food_name": "rice",
+      "category": "Meals",
+      "description": "fresh",
+      "quantity": 20.0,
+      "quantity_unit": "packets",
+      "servings": 20,
+      "is_veg": true,
+      "image_url": "https://upload.wikimedia.org/wikipedia/commons/1/15/Veg_rice.jpg?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail_unscaled",
+      "image_source": "search",
+      "preparation_time": "2026-10-13T01:33:00+00:00",
+      "available_until": "2026-10-13T06:38:00+00:00",
+      "pickup_available_until": "2026-10-13T05:37:00+00:00",
+      "pickup_location": "samanaickenpalayam",
+      "city": "Coimbatore",
+      "latitude": null,
+      "longitude": null,
+      "handling_instructions": "transport carefully",
+      "contact_name": "sanjay",
+      "contact_phone": "",
+      "status": "available",
+      "created_at": "2026-10-13T01:33:30.894837+00:00",
+      "updated_at": "2026-10-13T01:39:01.843439+00:00"
     }
   ],
   "donation_requests": [
@@ -397,6 +522,45 @@
         }
       ],
       "coordinating_ngo_id": "user-a92e2c7f"
+    },
+    {
+      "id": "request-a19ecce449f4413faf937c19a31e78ac",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "ngo_id": "user-03046c7f",
+      "requester_id": "user-03046c7f",
+      "requested_quantity": 15.0,
+      "quantity_unit": "packets",
+      "food_name": "rice",
+      "category": "Meals",
+      "priority": "medium",
+      "required_date": "2026-10-13",
+      "required_time": "11:10",
+      "delivery_location": "periyanaickenpalayam",
+      "multi_contribution": false,
+      "contributed_quantity": 0,
+      "delivered_quantity": 0,
+      "purpose": "Community support request for rice",
+      "status": "fulfilled",
+      "created_at": "2026-10-13T01:36:16.582368+00:00",
+      "updated_at": "2026-10-13T01:39:01.843379+00:00",
+      "status_history": [
+        {
+          "status": "pending",
+          "changed_by": "user-03046c7f",
+          "created_at": "2026-10-13T01:36:16.582411+00:00"
+        },
+        {
+          "status": "approved",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:38:18.083516+00:00"
+        },
+        {
+          "status": "fulfilled",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:39:01.843379+00:00"
+        }
+      ],
+      "coordinating_ngo_id": "user-a92e2c7f"
     }
   ],
   "request_contributions": [],
@@ -464,6 +628,53 @@
       "created_at": "2026-10-08T04:27:33.931225+00:00",
       "updated_at": "2026-10-08T04:29:21.715564+00:00",
       "volunteer_name": "ragul"
+    },
+    {
+      "id": "delivery-73abc0387b",
+      "request_id": "request-a19ecce449f4413faf937c19a31e78ac",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "ngo_id": "user-a92e2c7f",
+      "volunteer_id": "user-a92e2c7f",
+      "pickup_location": "samanaickenpalayam",
+      "pickup_instructions": "transport carefully",
+      "dropoff_location": "periyanaickenpalayam",
+      "dropoff_instructions": "",
+      "status": "delivered",
+      "status_history": [
+        {
+          "status": "open",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:38:23.897501+00:00"
+        },
+        {
+          "status": "assigned",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:38:59.077275+00:00"
+        },
+        {
+          "status": "accepted",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:39:00.787170+00:00"
+        },
+        {
+          "status": "picked_up",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:39:01.495150+00:00"
+        },
+        {
+          "status": "in_transit",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:39:01.671222+00:00"
+        },
+        {
+          "status": "delivered",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:39:01.843338+00:00"
+        }
+      ],
+      "created_at": "2026-10-13T01:38:23.897538+00:00",
+      "updated_at": "2026-10-13T01:39:01.843338+00:00",
+      "volunteer_name": "sandhya"
     }
   ],
   "delivery_feedback": [],
@@ -499,6 +710,39 @@
       ],
       "created_at": "2026-10-08T04:39:56.839726+00:00",
       "updated_at": "2026-10-08T04:52:41.665951+00:00",
+      "action_taken": true
+    },
+    {
+      "id": "issue-34ac965cb9",
+      "request_id": "request-a19ecce449f4413faf937c19a31e78ac",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "delivery_id": "delivery-73abc0387b",
+      "task_id": "delivery-73abc0387b",
+      "receiver_id": "user-03046c7f",
+      "reporter_id": "user-03046c7f",
+      "category": "food_quality",
+      "description": "not gud",
+      "status": "resolved",
+      "resolution_note": "",
+      "status_history": [
+        {
+          "status": "open",
+          "changed_by": "user-03046c7f",
+          "created_at": "2026-10-13T01:39:34.228191+00:00"
+        },
+        {
+          "status": "under_review",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:40:03.895972+00:00"
+        },
+        {
+          "status": "resolved",
+          "changed_by": "user-a92e2c7f",
+          "created_at": "2026-10-13T01:40:09.659850+00:00"
+        }
+      ],
+      "created_at": "2026-10-13T01:39:34.228191+00:00",
+      "updated_at": "2026-10-13T01:40:09.659850+00:00",
       "action_taken": true
     }
   ],
@@ -538,10 +782,56 @@
       "changed_by": "user-b5a84b15",
       "note": "A food delivery completed; some original quantity remains",
       "created_at": "2026-10-08T04:29:21.715668+00:00"
+    },
+    {
+      "id": "history-e3f896b0",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "previous_status": null,
+      "new_status": "available",
+      "changed_by": "user-978d2c6d",
+      "note": "Donation listed",
+      "created_at": "2026-10-13T01:33:30.894894+00:00"
+    },
+    {
+      "id": "history-e27bcc2bb078424493e2ddfb60a7ee50",
+      "donation_id": "donation-fbdb84fa8c5f4281b78c46e94798de1d",
+      "previous_status": "available",
+      "new_status": "expired",
+      "changed_by": "system",
+      "note": "Food validity period expired",
+      "created_at": "2026-10-13T01:34:30.952083+00:00"
+    },
+    {
+      "id": "history-b2679a474d004186ba4b041dfbb553e1",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "previous_status": "available",
+      "new_status": "requested",
+      "changed_by": "user-03046c7f",
+      "note": "A donation request was submitted",
+      "created_at": "2026-10-13T01:36:16.582474+00:00"
+    },
+    {
+      "id": "history-6e5208c4d79442819bea09a4f22e2339",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "previous_status": "requested",
+      "new_status": "accepted",
+      "changed_by": "user-a92e2c7f",
+      "note": "Donation request approved",
+      "created_at": "2026-10-13T01:38:18.083677+00:00"
+    },
+    {
+      "id": "history-98453478a5b04bf2bf86fd541b7062fa",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "previous_status": "accepted",
+      "new_status": "available",
+      "changed_by": "user-a92e2c7f",
+      "note": "A food delivery completed; some original quantity remains",
+      "created_at": "2026-10-13T01:39:01.843480+00:00"
     }
   ],
   "donation_submission_keys": {
-    "user-978d2c6d:39653cb9-8b56-4dfa-af8e-4430574f2e3a": "donation-fbdb84fa8c5f4281b78c46e94798de1d"
+    "user-978d2c6d:39653cb9-8b56-4dfa-af8e-4430574f2e3a": "donation-fbdb84fa8c5f4281b78c46e94798de1d",
+    "user-978d2c6d:af6d25e2-64e8-45f3-84ce-73c18b5e8b67": "donation-9d07c2d3b3ec47329e9132c3951e45f3"
   },
   "donation_certificates": [
     {
@@ -578,6 +868,24 @@
       "created_at": "2026-10-08T04:29:21.715779+00:00",
       "donation_id": "donation-fbdb84fa8c5f4281b78c46e94798de1d",
       "celebration_pending": false
+    },
+    {
+      "id": "certificate-e93aa01bf19d437ebab8db1a005a022c",
+      "certificate_id": "SFDRS-DON-73C481D0AC5B407E948B5311A2E1CA99",
+      "certificate_type": "donation",
+      "donor_id": "user-978d2c6d",
+      "donor_name": "sanjay",
+      "donation_id": "donation-9d07c2d3b3ec47329e9132c3951e45f3",
+      "food_name": "rice",
+      "category": "Meals",
+      "quantity": 20.0,
+      "quantity_unit": "packets",
+      "completed_donations": 2,
+      "donation_date": "2026-10-13T01:33:30.894837+00:00",
+      "delivery_date": "2026-10-13T01:39:01.843338+00:00",
+      "title": "Certificate of Food Donation",
+      "message": "Your generous food donation helped reduce food waste and bring nourishment to people in need.",
+      "created_at": "2026-10-13T01:39:01.843578+00:00"
     }
   ],
   "volunteer_availability": [

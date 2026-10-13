@@ -52,7 +52,7 @@ cd frontend
 npm install
 ```
 
-The Flask backend stores application records in `backend/data/app_data.json`; a fresh local installation starts with an empty data store. No sample accounts, demo records, or demo credentials are seeded automatically. Create an account through the existing Sign Up flow before logging in. No API key or environment file is required.
+The Flask backend stores application records in `backend/data/app_data.json`; a fresh local installation starts with an empty data store. The empty store is created only when the file does not exist; starting or restarting the backend never replaces an existing data file. Login creates a profile for a new email or reuses the existing profile for that email, retaining its user ID and data while applying the selected role; demo login accepts any non-empty password. Sign Up remains available as a separate account-creation form. No sample accounts, demo records, or demo credentials are seeded automatically. No API key or environment file is required.
 
 ## Run the app
 

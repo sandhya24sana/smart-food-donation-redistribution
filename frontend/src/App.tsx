@@ -1813,13 +1813,57 @@ function expiryToneClass(value?: string): string {
   return 'text-emerald-800'
 }
 
-function isFoodExpired(value?: string): boolean {
+function dateTimeHasPassed(value?: string, time?: string): boolean {
   if (!value) return false
-  const normalizedValue = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
-    ? value
-    : value.includes('T') ? `${value}Z` : `${value}T00:00:00Z`
-  const expiryTime = new Date(normalizedValue).getTime()
-  return Number.isFinite(expiryTime) && expiryTime <= Date.now()
+  const trimmedValue = value.trim()
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmedValue)
+  let deadline: Date
+  if (dateOnly) {
+    const year = Number(dateOnly[1])
+    const month = Number(dateOnly[2])
+    const day = Number(dateOnly[3])
+    const date = new Date(year, month - 1, day)
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+      return false
+    }
+    if (time) {
+      deadline = new Date(`${trimmedValue}T${time}`)
+    } else {
+      deadline = new Date(year, month - 1, day + 1)
+    }
+  } else {
+    deadline = new Date(trimmedValue)
+  }
+  const deadlineTime = deadline.getTime()
+  return Number.isFinite(deadlineTime) && deadlineTime <= Date.now()
+}
+
+function isFoodExpired(value?: string): boolean {
+  return dateTimeHasPassed(value)
+}
+
+function isPickupExpired(value?: string): boolean {
+  return dateTimeHasPassed(value)
+}
+
+function isDonationCurrent(donation: Pick<Donation, 'available_until' | 'pickup_available_until'>): boolean {
+  return !isFoodExpired(donation.available_until) && !isPickupExpired(donation.pickup_available_until)
+}
+
+function isHistoricalDonationStatus(status?: string): boolean {
+  return ['completed', 'fulfilled', 'delivered', 'cancelled', 'rejected'].includes(status || '')
+}
+
+function isHistoricalRequestStatus(status?: string): boolean {
+  return ['fulfilled', 'completed', 'delivered', 'cancelled', 'rejected'].includes(status || '')
+}
+
+function isFeedbackSubmittedOnLocalDay(value: string, localDay: Date): boolean {
+  const submittedAt = new Date(value)
+  return Number.isFinite(submittedAt.getTime())
+    && submittedAt.getFullYear() === localDay.getFullYear()
+    && submittedAt.getMonth() === localDay.getMonth()
+    && submittedAt.getDate() === localDay.getDate()
 }
 
 function donationCardStatuses(donation: PublicDonation): string[] {
@@ -2305,8 +2349,9 @@ function LandingPage() {
     { label: 'NGOs connected', value: overview?.stats.connected_organizations, icon: HeartHandshake },
   ]
   const needs = overview?.community_needs || []
+  const currentAvailableDonations = availableDonations.filter(isDonationCurrent)
   const featuredNeed = needs.find((need) => ['urgent', 'high', 'critical'].includes(need.urgency.toLowerCase())) || needs[0]
-  const featuredDonations = availableDonations.slice(0, 3)
+  const featuredDonations = currentAvailableDonations.slice(0, 3)
 
   const features = [
     { title: 'Smart donation matching', description: 'Connect donors with urgent local needs in minutes.', icon: Sparkles },
@@ -2562,6 +2607,9 @@ function PublicBrowsePage({ user }: { user: SessionUser | null }) {
   }, [])
 
   const stats = overview?.stats
+  const currentAvailableDonations = availableDonations.filter(isDonationCurrent)
+  const currentDonationIds = new Set(currentAvailableDonations.map((donation) => donation.id))
+  const currentMatches = (overview?.matches || []).filter((match) => currentDonationIds.has(match.donation_id))
   const statsCards = [
     { label: 'Donations listed', value: stats?.total_donations, icon: HandHeart, color: 'bg-[#edf8ef] text-[#1d4d3d]' },
     { label: 'Available now', value: stats?.available_donations, icon: Utensils, color: 'bg-[#fff4df] text-[#b45309]' },
@@ -2642,9 +2690,9 @@ function PublicBrowsePage({ user }: { user: SessionUser | null }) {
               </div>
               <Link to={publicActionUrl(user, 'requester', '/dashboard/requester#marketplace')} className="secondary-btn px-3 py-2 text-sm font-semibold">Request Food</Link>
             </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading available food…</p> : availableDonations.length ? (
+            {loading ? <p className="mt-4 text-sm text-slate-600">Loading available food…</p> : currentAvailableDonations.length ? (
               <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                {availableDonations.map((donation) => (
+                {currentAvailableDonations.map((donation) => (
                   <article key={donation.id} className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
                     <DonationImage donation={donation} className="h-48 w-full object-cover" />
                     <div className="p-4">
@@ -2709,9 +2757,9 @@ function PublicBrowsePage({ user }: { user: SessionUser | null }) {
               <h2 className="mt-1 text-2xl font-bold">Available food matched to community needs</h2>
               <p className="mt-1 text-sm text-slate-600">Matches require the same category and city, with available servings sufficient for the remaining need.</p>
             </div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Checking available listings and needs…</p> : overview?.matches.length ? (
+            {loading ? <p className="mt-4 text-sm text-slate-600">Checking available listings and needs…</p> : currentMatches.length ? (
               <div className="mt-5 grid gap-3 md:grid-cols-2">
-                {overview.matches.map((match) => (
+                {currentMatches.map((match) => (
                   <article key={`${match.donation_id}:${match.need_id}`} className="rounded-2xl border border-slate-200 bg-white p-4">
                     <div className="flex items-center gap-2 text-[#1d4d3d]"><Sparkles size={16} /><h3 className="font-bold">{match.food_name}</h3></div>
                     <p className="mt-2 text-sm text-slate-700">{match.available_quantity} {match.quantity_unit} available in {match.city}</p>
@@ -3874,14 +3922,27 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
   }, [currentFoodName, donorUploadedImage])
 
   const donorDonationIds = new Set(donations.map((donation) => donation.id))
+  const visibleDonations = donations.filter((donation) => (
+    isHistoricalDonationStatus(donation.status) || isDonationCurrent(donation)
+  ))
+  const isExpiredActiveRequest = (request: RequestItem) => (
+    !isHistoricalRequestStatus(request.status)
+    && (
+      dateTimeHasPassed(request.required_date, request.required_time)
+      || isFoodExpired(request.donation?.available_until)
+      || isPickupExpired(request.donation?.pickup_available_until)
+    )
+  )
   const supplierRequests = requests.filter((request) => !request.multi_contribution && request.donation_id && donorDonationIds.has(request.donation_id))
+  const visibleSupplierRequests = supplierRequests.filter((request) => !isExpiredActiveRequest(request))
   const openFoodRequests = requests.filter((request) =>
-    request.multi_contribution || (
+    !isExpiredActiveRequest(request)
+    && (request.multi_contribution || (
       !request.multi_contribution
       && request.donation_id
       && !donorDonationIds.has(request.donation_id)
-      && !['completed', 'fulfilled', 'rejected', 'cancelled'].includes(request.status)
-    ),
+      && !isHistoricalRequestStatus(request.status)
+    )),
   )
   const previewImage = !currentFoodName
     ? ''
@@ -4493,6 +4554,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
               const requestCategory = (requestItem.category || '').trim().toLocaleLowerCase()
               const requestFoodName = (requestItem.food_name || '').trim().toLocaleLowerCase()
               const matchingDonations = donations.filter((donation) => {
+                if (!isDonationCurrent(donation)) return false
                 const unitMatches = donation.quantity_unit.trim().toLocaleLowerCase()
                   === (requestItem.quantity_unit || '').trim().toLocaleLowerCase()
                 const foodMatches = requestCategory
@@ -4606,7 +4668,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
           <span className="rounded-full bg-[#edf8ef] px-2.5 py-1 text-xs font-semibold text-[#1d4d3d]">{donations.filter((donation) => ['available', 'requested', 'accepted'].includes(donation.status)).length} active listings</span>
         </div>
 
-        {donations.length ? (
+        {visibleDonations.length ? (
           <div className="overflow-hidden rounded-2xl border border-slate-200">
             <table className="min-w-full divide-y divide-slate-200 bg-white text-left text-sm">
               <thead className="bg-slate-50 text-slate-700">
@@ -4619,7 +4681,7 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {donations.map((donation) => (
+                {visibleDonations.map((donation) => (
                   <tr key={donation.id} id={`donation-feedback-${donation.id}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-3">
@@ -4676,6 +4738,8 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
               </tbody>
             </table>
           </div>
+        ) : donations.length ? (
+          <div className="rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No current donation listings.</div>
         ) : (
           <div className="rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">No donations yet. Create your first listing to get started.</div>
         )}
@@ -4687,9 +4751,9 @@ function DonorDashboard({ user, overview, donations, requests, needs, deliveryIs
           <span className="rounded-full bg-[#eff6ff] px-2.5 py-1 text-xs font-semibold text-[#1d4ed8]">{supplierRequests.filter((request) => !['completed', 'fulfilled', 'rejected', 'cancelled'].includes(request.status)).length} active requests</span>
         </div>
 
-        {supplierRequests.length ? (
+        {visibleSupplierRequests.length ? (
           <div className="space-y-3">
-            {supplierRequests.map((request) => {
+            {visibleSupplierRequests.map((request) => {
               const donation = donations.find((item) => item.id === request.donation_id)
               return (
                 <div key={request.id} className={`rounded-2xl border p-4 ${request.priority === 'high' ? 'border-amber-300 bg-amber-50/40' : 'border-slate-200 bg-white'}`}>
@@ -4870,6 +4934,7 @@ function NgoDashboard({
   onReload: () => Promise<void>
   onUserUpdate: (user: SessionUser) => void
 }) {
+  const [feedbackVisibilityDay, setFeedbackVisibilityDay] = useState(() => new Date())
   const [message, setMessage] = useState('')
   const [acceptingTaskId, setAcceptingTaskId] = useState<string | null>(null)
   const [issueStatusDrafts, setIssueStatusDrafts] = useState<Record<string, DeliveryIssue['status']>>({})
@@ -4888,6 +4953,20 @@ function NgoDashboard({
   const [submittingRequestIds, setSubmittingRequestIds] = useState<Set<string>>(() => new Set())
   const [requestFeedback, setRequestFeedback] = useState<Record<string, { type: 'success' | 'error'; text: string }>>({})
   const submittingRequestIdsRef = useRef(new Set<string>())
+  useEffect(() => {
+    let timeoutId: number
+    const scheduleNextLocalDay = () => {
+      const now = new Date()
+      const nextLocalDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+      timeoutId = window.setTimeout(() => {
+        setFeedbackVisibilityDay(new Date())
+        scheduleNextLocalDay()
+      }, nextLocalDay.getTime() - now.getTime() + 10)
+    }
+    scheduleNextLocalDay()
+    return () => window.clearTimeout(timeoutId)
+  }, [])
+
   const [foodRequestForm, setFoodRequestForm] = useState({
     food_name: '',
     category: 'Meals',
@@ -5559,20 +5638,28 @@ function NgoDashboard({
   ]
   const selectedDateAvailability = filteredAvailability.filter((entry) => entry.date === selectedAvailabilityDate)
   const requestHasExpiredDonation = (request: RequestItem) => Boolean(
-    request.donation_id && isFoodExpired(request.donation?.available_until),
+    dateTimeHasPassed(request.required_date, request.required_time)
+    || (
+      request.donation_id
+      && (
+        isFoodExpired(request.donation?.available_until)
+        || isPickupExpired(request.donation?.pickup_available_until)
+      )
+    ),
   )
   const isHistoricalRequest = (request: RequestItem) => (
-    ['fulfilled', 'completed', 'cancelled', 'rejected'].includes(request.status)
+    isHistoricalRequestStatus(request.status)
   )
   const requestHistoryItems = requests.filter((request) => (
     isHistoricalRequest(request) || !requestHasExpiredDonation(request)
   ))
   const coordinationRequests = requests
-    .filter((request) => !requestHasExpiredDonation(request))
+    .filter((request) => isHistoricalRequest(request) || !requestHasExpiredDonation(request))
     .map((request) => ({
       ...request,
       contributions: request.contributions?.filter((contribution) => (
         !isFoodExpired(contribution.available_until)
+        && !isPickupExpired(contribution.pickup_available_until)
         || ['delivered', 'cancelled', 'rejected'].includes(contribution.status)
         || contribution.delivery_status === 'delivered'
       )),
@@ -5656,9 +5743,9 @@ function NgoDashboard({
         <section id="marketplace" className="section-shell rounded-[28px] p-5">
           <h2 className="text-2xl font-bold text-slate-900">Available food</h2>
           <p className="mt-1 text-sm text-slate-600">Browse current donations and request food for your needs.</p>
-          {donations.length ? (
+          {donations.filter(isDonationCurrent).length ? (
             <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-              {donations.map((donation) => (
+              {donations.filter(isDonationCurrent).map((donation) => (
                 <article key={donation.id} className="overflow-hidden rounded-3xl border border-slate-200 bg-white">
                   <DonationImage donation={donation} className="h-48 w-full object-cover" />
                   <div className="p-4">
@@ -5898,7 +5985,7 @@ function NgoDashboard({
   }
 
   if (user.role === 'volunteer') {
-    const availableTasks = deliveryTasks.filter((task) => task.status === 'open')
+    const availableTasks = deliveryTasks.filter((task) => task.status === 'open' && isDonationCurrent(task))
     const myTasks = deliveryTasks.filter((task) => task.volunteer_id === user.id)
     const activeTasks = myTasks.filter((task) => task.status !== 'delivered' && task.status !== 'cancelled')
     const completedTasks = myTasks.filter((task) => task.status === 'delivered')
@@ -6440,9 +6527,14 @@ function NgoDashboard({
 
       <section id="delivery-feedback" className="section-shell rounded-[28px] p-5">
         <h2 className="flex items-center gap-2 text-2xl font-bold text-slate-900"><ClipboardList size={22} className="text-[#1d4d3d]" />Delivery Feedback &amp; Issues</h2>
-        {deliveryTasks.some((task) => task.feedback?.length || task.issues?.length) ? (
+        {deliveryTasks.some((task) => (
+          task.feedback?.some((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackVisibilityDay))
+          || task.issues?.length
+        )) ? (
           <div className="mt-4 space-y-3">
-            {deliveryTasks.flatMap((task) => (task.feedback || []).map((feedback) => (
+            {deliveryTasks.flatMap((task) => (task.feedback || [])
+              .filter((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackVisibilityDay))
+              .map((feedback) => (
               <article key={feedback.id} className="rounded-2xl border border-slate-200 bg-white p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>

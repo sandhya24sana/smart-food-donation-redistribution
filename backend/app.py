@@ -844,6 +844,22 @@ def task_deadline_datetime(value, date_only_is_end_of_day=False):
     return parsed.astimezone() if parsed.tzinfo is None else parsed
 
 
+def required_date_has_passed(required_date, required_time=None, now=None):
+    if not required_date:
+        return False
+    required_date_string = str(required_date).strip()
+    required_value = required_date_string
+    if required_time and len(required_date_string) == 10:
+        required_value = f'{required_date_string}T{required_time}'
+    deadline = task_deadline_datetime(required_value, date_only_is_end_of_day=True)
+    if deadline is None:
+        return False
+    current_time = now or datetime.now().astimezone()
+    if current_time.tzinfo is None:
+        current_time = current_time.astimezone()
+    return deadline <= current_time
+
+
 def delivery_task_deadline(data, task):
     deadlines = [
         task_deadline_datetime(task.get(field), date_only_is_end_of_day=True)
@@ -955,40 +971,7 @@ def load_data():
     if not DATA_FILE.exists():
         seed_data()
     with DATA_SAVE_LOCK:
-        data = json.loads(DATA_FILE.read_text(encoding='utf-8'))
-    donations = data.get('donations', [])
-    unique_donations = {}
-    duplicate_ids = set()
-    for donation in donations:
-        donation_id = donation.get('id')
-        if not donation_id or donation_id not in unique_donations:
-            unique_donations[donation_id or f'__missing_id_{len(unique_donations)}'] = donation
-            continue
-
-        duplicate_ids.add(donation_id)
-        existing = unique_donations[donation_id]
-        if donation.get('updated_at', '') > existing.get('updated_at', ''):
-            newer, older = donation, existing
-            unique_donations[donation_id] = newer
-        else:
-            newer, older = existing, donation
-        for key, value in older.items():
-            if newer.get(key) in (None, '') and value not in (None, ''):
-                newer[key] = value
-
-    data_changed = False
-    if duplicate_ids:
-        app.logger.warning(
-            'Removed duplicate donation rows for existing IDs: %s',
-            ', '.join(sorted(duplicate_ids)),
-        )
-        data['donations'] = list(unique_donations.values())
-        data_changed = True
-    if remove_expired_incomplete_delivery_tasks(data):
-        data_changed = True
-    if data_changed:
-        save_data(data)
-    return data
+        return json.loads(DATA_FILE.read_text(encoding='utf-8'))
 
 
 def save_data(data):
@@ -1583,6 +1566,7 @@ def public_dashboard_overview():
                 or donation_city != need_city
                 or remaining_need <= 0
                 or available_servings < remaining_need
+                or required_date_has_passed(need.get('required_date'))
             ):
                 continue
             matches.append({
@@ -1607,6 +1591,8 @@ def public_dashboard_overview():
             None,
         )
         need = needs_by_id.get(task.get('community_need_id'))
+        if need and required_date_has_passed(need.get('required_date')):
+            continue
         if donation_id and (
             not donation or not donation_can_continue_distribution(data, donation)
         ):
@@ -1690,7 +1676,10 @@ def public_dashboard_overview():
             'open_volunteer_opportunities': len(opportunities),
         },
         'organizations': organizations,
-        'community_needs': community_needs,
+        'community_needs': [
+            need for need in community_needs
+            if not required_date_has_passed(need.get('required_date'))
+        ],
         'matches': matches,
         'volunteers': volunteers,
         'volunteer_opportunities': opportunities,
@@ -2509,6 +2498,23 @@ def list_requests():
         ]
     else:
         requests_list = data['donation_requests']
+
+    historical_request_statuses = {'completed', 'fulfilled', 'delivered', 'rejected', 'cancelled'}
+    requests_list = [
+        request_item for request_item in requests_list
+        if (
+            request_item.get('status') in historical_request_statuses
+            or (
+                float(request_item.get('requested_quantity', 0) or 0) > 0
+                and request_delivered_quantity(data, request_item)
+                >= float(request_item.get('requested_quantity', 0) or 0)
+            )
+        )
+        or not required_date_has_passed(
+            request_item.get('required_date'),
+            request_item.get('required_time'),
+        )
+    ]
 
     donations_by_id = {item.get('id'): item for item in data.get('donations', [])}
     profiles_by_id = {item.get('id'): item for item in data.get('profiles', [])}
@@ -4679,6 +4685,8 @@ def list_needs():
                 status = 'pending_delivery' if need_contributions else 'open'
             if status not in {'open', 'partial', 'pending_delivery'}:
                 continue
+            if required_date_has_passed(need.get('required_date')):
+                continue
             public_needs.append({
                 'id': need.get('id'),
                 'category': need.get('category', ''),
@@ -4727,10 +4735,22 @@ def list_needs():
     if corrected_legacy_status:
         save_data(data)
 
+    historical_need_statuses = {'fulfilled', 'completed', 'delivered', 'cancelled', 'rejected'}
     if user['role'] == 'ngo':
-        needs = [need for need in data['community_needs'] if need['ngo_id'] == user['id']]
+        needs = [
+            need for need in data['community_needs']
+            if need['ngo_id'] == user['id']
+            and (
+                need.get('status') in historical_need_statuses
+                or not required_date_has_passed(need.get('required_date'))
+            )
+        ]
     elif user['role'] in {'donor', 'admin'}:
-        needs = [need for need in data['community_needs'] if need['status'] in {'open', 'partial', 'pending_delivery'}]
+        needs = [
+            need for need in data['community_needs']
+            if need['status'] in {'open', 'partial', 'pending_delivery'}
+            and not required_date_has_passed(need.get('required_date'))
+        ]
     else:
         needs = []
     if user['role'] == 'donor':
@@ -5399,7 +5419,11 @@ def ai_match():
         (item for item in data.get('donations', []) if donation_is_requestable(data, item)),
         None,
     )
-    need = next((n for n in data['community_needs'] if n['status'] == 'open'), None)
+    need = next((
+        item for item in data['community_needs']
+        if item['status'] == 'open'
+        and not required_date_has_passed(item.get('required_date'))
+    ), None)
     if donation and need:
         return jsonify({'match': {'title': 'Suggested match', 'reason': f'{donation["food_name"]} in {donation["city"]} fits the urgent {need["category"]} request in {need["location"]}.', 'confidence': 'Medium'}})
     return jsonify({'match': {'title': 'Suggested match', 'reason': 'No active needs are currently requiring a match. Keep listing food donations to help the network.', 'confidence': 'Low'}})
